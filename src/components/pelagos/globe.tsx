@@ -242,6 +242,41 @@ function phaseFor(id: string): number {
   return ((hash >>> 0) % 1000) / 1000;
 }
 
+/** What a terrain pass needs to shade the globe for one camera position. */
+type Shade = {
+  radius: number;
+  b: Basis;
+  cx: number;
+  cy: number;
+  night: number;
+  sun: [number, number, number];
+  detail: number;
+};
+
+type Surface = {
+  canvas: HTMLCanvasElement;
+  ctx: CanvasRenderingContext2D | null;
+  buf: ImageData | null;
+};
+
+function makeSurface(): Surface {
+  return { canvas: document.createElement("canvas"), ctx: null, buf: null };
+}
+
+/**
+ * Grows a surface in place; the canvas element is never replaced and never shrinks, so
+ * mobile toolbars sliding in and out don't reallocate megabytes on every resize.
+ */
+function sizeSurface(surface: Surface, width: number, height: number) {
+  if (surface.canvas.width >= width && surface.canvas.height >= height && surface.buf) return;
+  surface.canvas.width = Math.max(width, surface.canvas.width);
+  surface.canvas.height = Math.max(height, surface.canvas.height);
+  width = surface.canvas.width;
+  height = surface.canvas.height;
+  surface.ctx ??= surface.canvas.getContext("2d");
+  surface.buf = surface.ctx ? surface.ctx.createImageData(width, height) : null;
+}
+
 function tileX(lng: number, z: number): number {
   return ((lng + 180) / 360) * 2 ** z;
 }
@@ -291,11 +326,13 @@ function GlobeViewInner({ signals, routes, selectedId, onSelect, jump }: Props) 
       earthPx = data.data;
       earthW = scratch.width;
       earthH = scratch.height;
-      dirty = true;
+      // iOS frees canvas memory lazily; release the scratch right away.
+      scratch.width = 0;
+      scratch.height = 0;
+      invalidate();
     };
 
     const tiles = new Map<string, TileEntry>();
-    let dirty = true;
     const reduced = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
     const pointers = new Map<number, { x: number; y: number }>();
     let frame = 0;
@@ -318,12 +355,28 @@ function GlobeViewInner({ signals, routes, selectedId, onSelect, jump }: Props) 
     let lastTapY = 0;
     let lastSelected: string | null = null;
     let seenJump = 0;
-    let seenKey = "";
-    let tileClock = 0;
+    let tilePending = false;
     const shown = new Map<string, { lat: number; lng: number }>();
-    let terrain: HTMLCanvasElement | null = null;
-    let terrainCtx: CanvasRenderingContext2D | null = null;
-    let buf: ImageData | null = null;
+    // Terrain surfaces are allocated once per viewport size and reused every frame:
+    // re-creating canvases as the camera starts and stops leaks memory on iOS and blanks the globe.
+    const lo = makeSurface();
+    const hi = makeSurface();
+    let loKey = "";
+    let hiKey = "";
+    let hiRow = 0;
+    let hiReady = false;
+    let epoch = 0;
+    let lastInvalidate = 0;
+    let needsResize = true;
+    // Pixels the quick pass may shade per frame; tuned live from how long it takes.
+    let budget = 260_000;
+    let quickStride = 1;
+    const invalidate = () => {
+      epoch += 1;
+      lastInvalidate = performance.now();
+    };
+    const tileScratch = document.createElement("canvas");
+    const tileCtx = tileScratch.getContext("2d", { willReadFrequently: true });
 
     const lookupTile = (z: number, x: number, y: number): TileEntry | null => {
       const n = 2 ** z;
@@ -341,22 +394,23 @@ function GlobeViewInner({ signals, routes, selectedId, onSelect, jump }: Props) 
       const img = new Image();
       const created: TileEntry = { img, ready: false, pixels: null, w: 0, h: 0 };
       img.onload = () => {
-        const scratch = document.createElement("canvas");
-        scratch.width = img.width;
-        scratch.height = img.height;
-        const ictx = scratch.getContext("2d", { willReadFrequently: true });
-        if (!ictx) return;
-        ictx.drawImage(img, 0, 0);
+        if (!tileCtx) return;
+        if (tileScratch.width !== img.width || tileScratch.height !== img.height) {
+          tileScratch.width = img.width;
+          tileScratch.height = img.height;
+        }
+        tileCtx.drawImage(img, 0, 0);
         try {
-          created.pixels = ictx.getImageData(0, 0, scratch.width, scratch.height).data;
+          created.pixels = tileCtx.getImageData(0, 0, img.width, img.height).data;
         } catch {
           return; // a tile served without CORS stays unreadable; the base texture covers it
         }
-        created.w = scratch.width;
-        created.h = scratch.height;
+        created.w = img.width;
+        created.h = img.height;
         created.ready = true;
-        tileClock = performance.now();
-        dirty = true;
+        // A burst of tiles should not restart the sharp render on every arrival.
+        if (performance.now() - lastInvalidate > 150) invalidate();
+        else tilePending = true;
       };
       // Tiles are read back as pixels, so they must load as CORS images.
       img.crossOrigin = "anonymous";
@@ -368,6 +422,7 @@ function GlobeViewInner({ signals, routes, selectedId, onSelect, jump }: Props) 
       }
     };
 
+    const rgb: [number, number, number] = [0, 0, 0];
     const sample = (lat: number, lng: number, z: number): [number, number, number] => {
       // Web Mercator tiles stop at ±85°; the poles come from the base texture.
       for (let level = Math.abs(lat) < 84.5 ? z : 0; level >= 3; level -= 1) {
@@ -380,30 +435,129 @@ function GlobeViewInner({ signals, routes, selectedId, onSelect, jump }: Props) 
         const u = clamp(Math.floor((tx - ix) * entry.w), 0, entry.w - 1);
         const v = clamp(Math.floor((ty - iy) * entry.h), 0, entry.h - 1);
         const i = (v * entry.w + u) * 4;
-        return [entry.pixels[i], entry.pixels[i + 1], entry.pixels[i + 2]];
+        rgb[0] = entry.pixels[i];
+        rgb[1] = entry.pixels[i + 1];
+        rgb[2] = entry.pixels[i + 2];
+        return rgb;
       }
       if (earthPx) {
-        let u = ((lng + 180) / 360) * earthW;
+        // Bilinear: the base texture is low-res, and nearest-neighbour shimmers as the globe turns.
+        let u = ((lng + 180) / 360) * earthW - 0.5;
         u = ((u % earthW) + earthW) % earthW;
-        const v = clamp(((90 - lat) / 180) * earthH, 0, earthH - 1);
-        const i = (Math.floor(v) * earthW + Math.floor(u)) * 4;
-        return [earthPx[i], earthPx[i + 1], earthPx[i + 2]];
+        const v = clamp(((90 - lat) / 180) * earthH - 0.5, 0, earthH - 1);
+        const u0 = Math.floor(u);
+        const v0 = Math.floor(v);
+        const u1 = (u0 + 1) % earthW;
+        const v1 = Math.min(earthH - 1, v0 + 1);
+        const fu = u - u0;
+        const fv = v - v0;
+        const a = (v0 * earthW + u0) * 4;
+        const b2 = (v0 * earthW + u1) * 4;
+        const c = (v1 * earthW + u0) * 4;
+        const d = (v1 * earthW + u1) * 4;
+        const w00 = (1 - fu) * (1 - fv);
+        const w10 = fu * (1 - fv);
+        const w01 = (1 - fu) * fv;
+        const w11 = fu * fv;
+        rgb[0] = earthPx[a] * w00 + earthPx[b2] * w10 + earthPx[c] * w01 + earthPx[d] * w11;
+        rgb[1] = earthPx[a + 1] * w00 + earthPx[b2 + 1] * w10 + earthPx[c + 1] * w01 + earthPx[d + 1] * w11;
+        rgb[2] = earthPx[a + 2] * w00 + earthPx[b2 + 2] * w10 + earthPx[c + 2] * w01 + earthPx[d + 2] * w11;
+        return rgb;
       }
-      return [14, 92, 122];
+      rgb[0] = 14;
+      rgb[1] = 92;
+      rgb[2] = 122;
+      return rgb;
     };
 
-    const resize = () => {
-      const dpr = Math.min(2, window.devicePixelRatio || 1);
-      const w = wrap.clientWidth || window.innerWidth;
-      const h = wrap.clientHeight || window.innerHeight;
-      canvas.width = Math.max(2, Math.floor(w * dpr));
-      canvas.height = Math.max(2, Math.floor(h * dpr));
+    // Setting a canvas's size clears it, even to the same value. Resize only on a real change,
+    // and only at the start of a paint so the cleared canvas is redrawn in the same frame.
+    /** Shades rows [y0, y1), columns [x0, x1) of a buffer; each buffer pixel covers `px` CSS pixels. */
+    const shadeRows = (
+      out: ImageData,
+      x0: number,
+      x1: number,
+      px: number,
+      y0: number,
+      y1: number,
+      sh: Shade,
+    ) => {
+      const pix = out.data;
+      const rowWidth = out.width;
+      const { radius, b, cx, cy, night, detail } = sh;
+      const [sx0, sy0, sz0] = sh.sun;
+      for (let y = y0; y < y1; y += 1) {
+        const ny = (cy - (y + 0.5) * px) / radius;
+        const row = y * rowWidth;
+        for (let x = x0; x < x1; x += 1) {
+          const nx = ((x + 0.5) * px - cx) / radius;
+          const i = (row + x) * 4;
+          const r2 = nx * nx + ny * ny;
+          if (r2 > 1) {
+            pix[i + 3] = 0;
+            continue;
+          }
+          const nz = Math.sqrt(1 - r2);
+          const wx = nx * b.rx + ny * b.ux + nz * b.fx;
+          const wy = nx * b.ry + ny * b.uy + nz * b.fy;
+          const wz = nx * b.rz + ny * b.uz + nz * b.fz;
+          const color = sample(Math.asin(clamp(wz, -1, 1)) * R2D, Math.atan2(wy, wx) * R2D, detail);
+          const light = 0.8 + 0.2 * nz;
+          let dark = 0;
+          if (night > 0) {
+            // A wide, eased terminator: dusk fades over ~20° instead of a hard line.
+            const t = clamp((wx * sx0 + wy * sy0 + wz * sz0 + 0.18) / 0.36, 0, 1);
+            dark = night * (1 - t * t * (3 - 2 * t));
+          }
+          pix[i] = color[0] * light * (1 - dark);
+          pix[i + 1] = color[1] * light * (1 - dark * 0.9);
+          pix[i + 2] = color[2] * light * (1 - dark * 0.72);
+          // Soft edge: anti-alias the limb instead of a jagged stair-step.
+          const edge = (1 - Math.sqrt(r2)) * radius;
+          pix[i + 3] = edge < px ? Math.max(0, (edge / px) * 255) : 255;
+        }
+      }
+    };
+
+    const requestVisibleTiles = (w: number, h: number, radius: number, b: Basis, detail: number) => {
+      const tilePx = ((360 / 2 ** detail) * radius * Math.PI) / 180;
+      const step = Math.max(36, Math.min(tilePx * 0.75, 240));
+      for (let sy = 0; sy <= h; sy += step) {
+        for (let sx = 0; sx <= w; sx += step) {
+          const nnx = (sx - w / 2) / radius;
+          const nny = (h / 2 - sy) / radius;
+          const rr = nnx * nnx + nny * nny;
+          if (rr > 1) continue;
+          const nnz = Math.sqrt(1 - rr);
+          const wwx = nnx * b.rx + nny * b.ux + nnz * b.fx;
+          const wwy = nnx * b.ry + nny * b.uy + nnz * b.fy;
+          const wwz = nnx * b.rz + nny * b.uz + nnz * b.fz;
+          const plat = Math.asin(clamp(wwz, -1, 1)) * R2D;
+          const plng = Math.atan2(wwy, wwx) * R2D;
+          requestTile(detail, Math.floor(tileX(plng, detail)), Math.floor(tileY(plat, detail)));
+          if (detail > 4) {
+            requestTile(detail - 1, Math.floor(tileX(plng, detail - 1)), Math.floor(tileY(plat, detail - 1)));
+          }
+        }
+      }
+    };
+
+    const resize = (w: number, h: number, dpr: number) => {
+      const cw = Math.max(2, Math.floor(w * dpr));
+      const ch = Math.max(2, Math.floor(h * dpr));
+      if (canvas.width !== cw || canvas.height !== ch) {
+        canvas.width = cw;
+        canvas.height = ch;
+      }
       canvas.style.width = `${w}px`;
       canvas.style.height = `${h}px`;
-      dirty = true;
+      sizeSurface(lo, Math.ceil(w), Math.ceil(h));
+      sizeSurface(hi, Math.ceil(w * dpr), Math.ceil(h * dpr));
+      invalidate();
     };
-    resize();
-    const observer = new ResizeObserver(resize);
+    const observer = new ResizeObserver(() => {
+      needsResize = true;
+    });
     observer.observe(wrap);
 
     const screenPoint = (clientX: number, clientY: number, b: Basis, radius: number, w: number, h: number) => {
@@ -461,7 +615,14 @@ function GlobeViewInner({ signals, routes, selectedId, onSelect, jump }: Props) 
       const w = wrap.clientWidth || window.innerWidth;
       const h = wrap.clientHeight || window.innerHeight;
       const dpr = Math.min(2, window.devicePixelRatio || 1);
-      if (canvas.width !== Math.floor(w * dpr) || canvas.height !== Math.floor(h * dpr)) resize();
+      if (needsResize || canvas.width !== Math.floor(w * dpr) || canvas.height !== Math.floor(h * dpr)) {
+        needsResize = false;
+        resize(w, h, dpr);
+      }
+      if (tilePending && performance.now() - lastInvalidate > 150) {
+        tilePending = false;
+        invalidate();
+      }
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
       const view = viewRef.current;
       const aim = targetRef.current;
@@ -515,7 +676,6 @@ function GlobeViewInner({ signals, routes, selectedId, onSelect, jump }: Props) 
         view.lat = clamp(view.lat + gapLat * follow, -85, 85);
         view.lng = wrapLng(view.lng + gapLng * follow);
         view.zoom = clamp(view.zoom + gapZoom * follow, ZOOM_MIN, ZOOM_MAX);
-        dirty = true;
       }
       const gliding =
         Math.abs(aim.lat - view.lat) > 0.02 ||
@@ -525,126 +685,117 @@ function GlobeViewInner({ signals, routes, selectedId, onSelect, jump }: Props) 
       if (Date.now() - sunAt > 60_000) {
         sunAt = Date.now();
         sun = sunVector(sunAt);
-        dirty = true;
+        invalidate();
       }
       const radius = radiusFor(view.zoom, w, h);
       const b = basis(view.lat, view.lng);
-      const movingCamera = interacting || gliding || Math.abs(velLat) > 0.004 || Math.abs(velLng) > 0.004;
-      const settling = performance.now() - tileClock < 220;
-      // The idle spin is slow and the whole globe fits on screen, so it can afford full resolution.
-      const idleSpin = spin && !movingCamera && radius * radius * Math.PI < 700_000;
-      const stride = (movingCamera || spin || settling) && !idleSpin ? (w * h > 900000 ? 3 : 2) : 1;
-      // Once the camera rests, render the terrain at device resolution so retina screens stay crisp.
-      const scale = !movingCamera && !spin && !settling ? dpr : 1;
-      const px = stride / scale;
-      const bw = Math.max(2, Math.ceil(w / px));
-      const bh = Math.max(2, Math.ceil(h / px));
-      if (!terrain || terrain.width !== bw || terrain.height !== bh) {
-        terrain = document.createElement("canvas");
-        terrain.width = bw;
-        terrain.height = bh;
-        terrainCtx = terrain.getContext("2d", { willReadFrequently: true });
-        buf = null;
-        dirty = true;
+      const movingCamera =
+        interacting || gliding || Math.abs(velLat) > 0.004 || Math.abs(velLng) > 0.004;
+      const resting = !movingCamera && !spin;
+      // Moving: shade as many pixels as the device keeps up with. Resting: full resolution.
+      // Pixels in the globe's bounding box at full resolution (what the quick pass would shade).
+      const globePx = Math.min(4 * radius * radius, w * h);
+      // The resting frame is sharpened separately (below), so the quick pass keeps its moving
+      // resolution and letting go of the globe never stalls a frame.
+      // Hysteresis: change resolution only when the budget is clearly past the next step,
+      // so the globe does not flicker between sharp and soft while it moves.
+      if (quickStride < 3 && globePx / (quickStride * quickStride) > budget * 1.2) quickStride += 1;
+      else if (quickStride > 1 && globePx / ((quickStride - 1) * (quickStride - 1)) < budget * 0.8) {
+        quickStride -= 1;
       }
-      const viewKey = `${view.lat.toFixed(2)}|${view.lng.toFixed(2)}|${view.zoom.toFixed(2)}|${bw}|${bh}`;
-      if (viewKey !== seenKey) {
-        seenKey = viewKey;
-        dirty = true;
-      }
-      if (dirty && terrainCtx && terrain) {
-        if (!buf || buf.width !== bw || buf.height !== bh) buf = terrainCtx.createImageData(bw, bh);
-        const pix = buf.data;
-        const cx = w / 2;
-        const cy = h / 2;
+      const stride = quickStride;
+      const bw = Math.max(2, Math.ceil(w / stride));
+      const bh = Math.max(2, Math.ceil(h / stride));
+      const view4 = `${view.lat.toFixed(3)}|${view.lng.toFixed(3)}|${view.zoom.toFixed(3)}|${epoch}`;
+      // At rest, swap the low-res base texture for satellite tiles matched to the screen:
+      // a phone's globe gets the 64-tile world, a large retina globe the 256-tile one.
+      const globeDevicePx = radius * dpr;
+      const detail =
+        radius > Math.min(w, h) * 0.72
+          ? clamp(Math.round(Math.log2(((radius * Math.PI) / 180) * (360 / 256))), 3, 10)
+          : !resting
+            ? 0
+            : globeDevicePx >= 900
+              ? 4
+              : globeDevicePx >= 280
+                ? 3
+                : 0;
+      const shade: Shade = {
+        radius,
+        b,
+        cx: w / 2,
+        cy: h / 2,
         // Night shading fades out as you zoom in, so close-up imagery stays readable.
-        const night = clamp((3 - view.zoom) / 2, 0, 1) * 0.55;
-        const [sx0, sy0, sz0] = sun;
-        // Sun glint: the half-vector between the sun and the viewer.
-        let hx = sx0 + b.fx;
-        let hy = sy0 + b.fy;
-        let hz = sz0 + b.fz;
-        const hl = Math.hypot(hx, hy, hz) || 1;
-        hx /= hl;
-        hy /= hl;
-        hz /= hl;
-        const glint = night > 0 ? night / 0.55 : 0;
-        const detail =
-          radius > Math.min(w, h) * 0.72
-            ? clamp(Math.round(Math.log2(((radius * Math.PI) / 180) * (360 / 256))), 3, 10)
-            : scale > 1 && radius * dpr >= 420
-              ? 3
-              : 0;
-        if (detail >= 3) {
-          const tilePx = ((360 / 2 ** detail) * radius * Math.PI) / 180;
-          const step = Math.max(36, Math.min(tilePx * 0.75, 240));
-          for (let sy = 0; sy <= h; sy += step) {
-            for (let sx = 0; sx <= w; sx += step) {
-              const nnx = (sx - w / 2) / radius;
-              const nny = (h / 2 - sy) / radius;
-              const rr = nnx * nnx + nny * nny;
-              if (rr > 1) continue;
-              const nnz = Math.sqrt(1 - rr);
-              const wwx = nnx * b.rx + nny * b.ux + nnz * b.fx;
-              const wwy = nnx * b.ry + nny * b.uy + nnz * b.fy;
-              const wwz = nnx * b.rz + nny * b.uz + nnz * b.fz;
-              const plat = Math.asin(clamp(wwz, -1, 1)) * R2D;
-              const plng = Math.atan2(wwy, wwx) * R2D;
-              requestTile(detail, Math.floor(tileX(plng, detail)), Math.floor(tileY(plat, detail)));
-              if (detail > 4) {
-                requestTile(
-                  detail - 1,
-                  Math.floor(tileX(plng, detail - 1)),
-                  Math.floor(tileY(plat, detail - 1)),
-                );
-              }
-            }
-          }
+        night: clamp((3 - view.zoom) / 2, 0, 1) * 0.5,
+        sun,
+        detail,
+      };
+      // Only the globe's bounding box is shaded and drawn; the space around it stays empty.
+      const box = (px: number, maxW: number, maxH: number) => ({
+        x0: clamp(Math.floor((w / 2 - radius) / px) - 1, 0, maxW),
+        x1: clamp(Math.ceil((w / 2 + radius) / px) + 1, 0, maxW),
+        y0: clamp(Math.floor((h / 2 - radius) / px) - 1, 0, maxH),
+        y1: clamp(Math.ceil((h / 2 + radius) / px) + 1, 0, maxH),
+      });
+      const loBox = box(stride, bw, bh);
+      const nextLoKey = `${view4}|${stride}|${detail}`;
+      if (nextLoKey !== loKey && lo.ctx && lo.buf) {
+        loKey = nextLoKey;
+        if (detail >= 3) requestVisibleTiles(w, h, radius, b, detail);
+        const t0 = performance.now();
+        shadeRows(lo.buf, loBox.x0, loBox.x1, stride, loBox.y0, loBox.y1, shade);
+        lo.ctx.putImageData(
+          lo.buf,
+          0,
+          0,
+          loBox.x0,
+          loBox.y0,
+          loBox.x1 - loBox.x0,
+          loBox.y1 - loBox.y0,
+        );
+        const spent = performance.now() - t0;
+        if (!resting && spent > 0.5) {
+          // Aim the quick pass at ~7 ms, from the measured cost of each shaded pixel.
+          const shaded = (loBox.x1 - loBox.x0) * (loBox.y1 - loBox.y0);
+          const target = (7 / spent) * shaded;
+          budget = clamp(budget * 0.7 + target * 0.3, 20_000, 1_500_000);
         }
-        for (let y = 0; y < bh; y += 1) {
-          const ny = (cy - (y + 0.5) * px) / radius;
-          const row = y * bw;
-          for (let x = 0; x < bw; x += 1) {
-            const nx = ((x + 0.5) * px - cx) / radius;
-            const i = (row + x) * 4;
-            const r2 = nx * nx + ny * ny;
-            if (r2 > 1) {
-              pix[i + 3] = 0;
-              continue;
-            }
-            const nz = Math.sqrt(1 - r2);
-            const wx = nx * b.rx + ny * b.ux + nz * b.fx;
-            const wy = nx * b.ry + ny * b.uy + nz * b.fy;
-            const wz = nx * b.rz + ny * b.uz + nz * b.fz;
-            const lat = Math.asin(clamp(wz, -1, 1)) * R2D;
-            const lng = Math.atan2(wy, wx) * R2D;
-            const color = sample(lat, lng, detail);
-            const light = 0.78 + 0.22 * nz;
-            let dark = 0;
-            if (night > 0) {
-              const t = clamp((wx * sx0 + wy * sy0 + wz * sz0 + 0.1) / 0.2, 0, 1);
-              dark = night * (1 - t * t * (3 - 2 * t));
-            }
-            let shine = 0;
-            if (glint > 0 && color[2] > color[0] + 8 && color[2] >= color[1]) {
-              const d = wx * hx + wy * hy + wz * hz;
-              if (d > 0.97) {
-                const d4 = d * d * d * d;
-                const d16 = d4 * d4 * d4 * d4;
-                const d64 = d16 * d16 * d16 * d16;
-                shine = d64 * d64 * glint * 85;
-              }
-            }
-            pix[i] = color[0] * light * (1 - dark) + shine;
-            pix[i + 1] = color[1] * light * (1 - dark * 0.9) + shine;
-            pix[i + 2] = color[2] * light * (1 - dark * 0.72) + shine * 0.9;
-            pix[i + 3] = 255;
-          }
-        }
-        terrainCtx.putImageData(buf, 0, 0);
-        dirty = false;
       }
-
+      // Resting: sharpen to full device resolution in slices across frames, not one long stall.
+      const sharpen = resting && Boolean(hi.ctx && hi.buf);
+      if (sharpen && hi.buf && hi.ctx) {
+        const nextHiKey = `${view4}|${detail}`;
+        if (nextHiKey !== hiKey) {
+          hiKey = nextHiKey;
+          hiRow = 0;
+          hiReady = false;
+        }
+        const hiBox = box(1 / dpr, Math.ceil(w * dpr), Math.ceil(h * dpr));
+        if (!hiReady) {
+          if (hiRow < hiBox.y0) hiRow = hiBox.y0;
+          const t0 = performance.now();
+          while (hiRow < hiBox.y1 && performance.now() - t0 < 6) {
+            const next = Math.min(hiBox.y1, hiRow + 16);
+            shadeRows(hi.buf, hiBox.x0, hiBox.x1, 1 / dpr, hiRow, next, shade);
+            hiRow = next;
+          }
+          if (hiRow >= hiBox.y1) {
+            hi.ctx.putImageData(
+              hi.buf,
+              0,
+              0,
+              hiBox.x0,
+              hiBox.y0,
+              hiBox.x1 - hiBox.x0,
+              hiBox.y1 - hiBox.y0,
+            );
+            hiReady = true;
+          }
+        }
+      } else {
+        hiKey = "";
+        hiReady = false;
+      }
       ctx.fillStyle = "#071016";
       ctx.fillRect(0, 0, w, h);
       if (radius < Math.hypot(w, h) * 0.5) {
@@ -668,9 +819,30 @@ function GlobeViewInner({ signals, routes, selectedId, onSelect, jump }: Props) 
         ctx.arc(w / 2, h / 2, radius * 1.22, 0, Math.PI * 2);
         ctx.fill();
       }
-      if (terrain) {
-        ctx.imageSmoothingEnabled = stride > 1;
-        ctx.drawImage(terrain, 0, 0, w, h);
+      ctx.imageSmoothingEnabled = true;
+      if (sharpen && hiReady) {
+        const hb = box(1 / dpr, Math.ceil(w * dpr), Math.ceil(h * dpr));
+        const sw = hb.x1 - hb.x0;
+        const sh2 = hb.y1 - hb.y0;
+        if (sw > 0 && sh2 > 0) {
+          ctx.drawImage(hi.canvas, hb.x0, hb.y0, sw, sh2, hb.x0 / dpr, hb.y0 / dpr, sw / dpr, sh2 / dpr);
+        }
+      } else {
+        const sw = loBox.x1 - loBox.x0;
+        const sh2 = loBox.y1 - loBox.y0;
+        if (sw > 0 && sh2 > 0) {
+          ctx.drawImage(
+            lo.canvas,
+            loBox.x0,
+            loBox.y0,
+            sw,
+            sh2,
+            loBox.x0 * stride,
+            loBox.y0 * stride,
+            sw * stride,
+            sh2 * stride,
+          );
+        }
       }
       if (radius < Math.hypot(w, h) * 0.55) {
         ctx.beginPath();
@@ -1086,6 +1258,14 @@ function GlobeViewInner({ signals, routes, selectedId, onSelect, jump }: Props) 
     canvas.addEventListener("click", click);
     canvas.addEventListener("pointerleave", leave);
     wrap.addEventListener("wheel", wheel, { passive: false });
+    // touch-action alone does not stop iOS from scrolling the page or dragging an in-app
+    // browser sheet while a finger turns the globe; cancelling the touch moves does.
+    const holdTouch = (event: TouchEvent) => {
+      if (event.cancelable) event.preventDefault();
+    };
+    const holdGesture = (event: Event) => event.preventDefault();
+    canvas.addEventListener("touchmove", holdTouch, { passive: false });
+    canvas.addEventListener("gesturestart", holdGesture);
 
     return () => {
       cancelAnimationFrame(frame);
@@ -1097,6 +1277,14 @@ function GlobeViewInner({ signals, routes, selectedId, onSelect, jump }: Props) 
       canvas.removeEventListener("click", click);
       canvas.removeEventListener("pointerleave", leave);
       wrap.removeEventListener("wheel", wheel);
+      canvas.removeEventListener("touchmove", holdTouch);
+      canvas.removeEventListener("gesturestart", holdGesture);
+      for (const surface of [lo, hi]) {
+        surface.canvas.width = 0;
+        surface.canvas.height = 0;
+      }
+      tileScratch.width = 0;
+      tileScratch.height = 0;
     };
   }, []);
 
