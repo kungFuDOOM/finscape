@@ -4,6 +4,10 @@ const UA = "FinScape/1.0 (educational live ocean map)";
 const MAP_ID = 3413;
 const MAPOTIC = `https://www.mapotic.com/api/v1/maps/${MAP_ID}`;
 const TTL_MS = 75_000;
+// A forced refresh still waits this long, so many open tabs share one upstream pull.
+const FRESH_FLOOR_MS = 30_000;
+// Research-grade sightings change slowly and cost ~24 iNaturalist calls per pull.
+const SIGHTING_TTL_MS = 15 * 60_000;
 const INAT_PAGE = 60;
 
 const THEATERS: Array<[string, number, number, number, number]> = [
@@ -26,6 +30,7 @@ const TAXA: Array<{ group: Group; taxon: string }> = [
 type Cache = { at: number; data: Feed };
 let cache: Cache | null = null;
 let inflight: Promise<Feed> | null = null;
+let sightingCache: { at: number; data: InatResult } | null = null;
 const trackCache = new Map<number, { at: number; data: Track }>();
 let routeCache: { at: number; data: LiveRoute[] } | null = null;
 let routeInflight: Promise<LiveRoute[]> | null = null;
@@ -112,7 +117,8 @@ function parseMotion(value: unknown): TrackPoint[] {
 }
 
 export function loadSignals(fresh = false): Promise<Feed> {
-  if (!fresh && cache && Date.now() - cache.at < TTL_MS) return Promise.resolve(cache.data);
+  const age = cache ? Date.now() - cache.at : Infinity;
+  if (cache && age < (fresh ? FRESH_FLOOR_MS : TTL_MS)) return Promise.resolve(cache.data);
   if (inflight) return inflight;
   inflight = buildFeed()
     .then((data) => {
@@ -156,7 +162,7 @@ export async function loadTrack(tagId: number): Promise<Track> {
 
 async function buildFeed(): Promise<Feed> {
   const since = new Date(Date.now() - 400 * 86_400_000).toISOString().slice(0, 10);
-  const [tags, sightings] = await Promise.all([fetchOcearch(), fetchInat(since)]);
+  const [tags, sightings] = await Promise.all([fetchOcearch(), loadSightings(since)]);
   const signals = [...tags.signals, ...sightings.signals].sort((a, b) =>
     a.observedAt < b.observedAt ? 1 : -1,
   );
@@ -165,6 +171,19 @@ async function buildFeed(): Promise<Feed> {
     signals,
     sources: [tags.status, sightings.status],
   };
+}
+
+async function loadSightings(since: string): Promise<InatResult> {
+  if (sightingCache && Date.now() - sightingCache.at < SIGHTING_TTL_MS) return sightingCache.data;
+  const next = await fetchInat(since);
+  if (next.status.ok) {
+    sightingCache = { at: Date.now(), data: next };
+    return next;
+  }
+  // Keep the last good batch when iNaturalist stumbles, and retry in ~2 minutes, not every pull.
+  const retryAt = Date.now() - SIGHTING_TTL_MS + 2 * 60_000;
+  sightingCache = { at: retryAt, data: sightingCache?.data ?? next };
+  return sightingCache.data;
 }
 
 async function fetchJson(url: string, timeoutMs: number): Promise<unknown> {

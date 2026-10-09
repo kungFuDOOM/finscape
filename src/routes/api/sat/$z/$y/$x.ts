@@ -18,12 +18,14 @@ export const Route = createFileRoute("/api/sat/$z/$y/$x")({
         }
         const upstream = await fetch(`${TILE}/${z}/${y}/${x}`, {
           headers: { "User-Agent": "FinScape/1.0" },
-        });
-        if (!upstream.ok) return new Response("Tile missing", { status: 502 });
+          signal: AbortSignal.timeout(10_000),
+        }).catch(() => null);
+        if (!upstream?.ok) return new Response("Tile missing", { status: 502 });
         return new Response(await upstream.arrayBuffer(), {
           headers: {
             "content-type": upstream.headers.get("content-type") || "image/jpeg",
-            "cache-control": "public, max-age=86400",
+            // Imagery barely changes; let the CDN hold tiles for a week so the globe loads fast.
+            "cache-control": "public, max-age=86400, s-maxage=604800, stale-while-revalidate=86400",
           },
         });
       },

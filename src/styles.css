@@ -81,6 +81,48 @@
   pointer-events: none;
 }
 
+.dock-row {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.surprise {
+  pointer-events: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  min-height: 2.65rem;
+  padding: 0 0.85rem;
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  color: var(--color-fg);
+}
+
+.surprise svg {
+  color: var(--color-phosphor);
+}
+
+.surprise:hover:not(:disabled) {
+  background: var(--color-surface-2);
+}
+
+.surprise:disabled {
+  opacity: 0.45;
+}
+
+input[type="search"]::-webkit-search-cancel-button {
+  display: none;
+}
+
+.dossier-photo {
+  display: block;
+  width: 100%;
+  height: 9.5rem;
+  object-fit: cover;
+  border-bottom: 1px solid var(--color-line);
+}
+
 .legend {
   display: flex;
   gap: 0.75rem;
@@ -116,6 +158,12 @@
   margin-top: 0.45rem;
   overflow-x: auto;
   scrollbar-width: none;
+}
+
+@media (max-width: 767px) {
+  .oceans {
+    mask-image: linear-gradient(to right, #000 85%, transparent);
+  }
 }
 
 .oceans::-webkit-scrollbar {

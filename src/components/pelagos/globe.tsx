@@ -21,6 +21,7 @@ type Dot = {
   moving: boolean;
   kind: Signal["kind"];
   name: string;
+  common: string;
   heading: number | null;
   fresh: boolean;
 };
@@ -203,6 +204,33 @@ function project(
   return { x: cx + nx * radius, y: cy - ny * radius };
 }
 
+/** Unit vector toward the sun in the globe's frame, from a low-precision solar position. */
+function sunVector(at: number): [number, number, number] {
+  const date = new Date(at);
+  const start = Date.UTC(date.getUTCFullYear(), 0, 0);
+  const day = (at - start) / 86_400_000;
+  const decl = -23.44 * Math.cos(((2 * Math.PI) / 365) * (day + 10)) * D2R;
+  const hours = date.getUTCHours() + date.getUTCMinutes() / 60 + date.getUTCSeconds() / 3600;
+  const lng = wrapLng(-(hours - 12) * 15) * D2R;
+  return [Math.cos(decl) * Math.cos(lng), Math.cos(decl) * Math.sin(lng), Math.sin(decl)];
+}
+
+function makeStars(count: number): { x: number; y: number; r: number; a: number }[] {
+  let seed = 7;
+  const rand = () => {
+    seed = (seed * 16807) % 2147483647;
+    return seed / 2147483647;
+  };
+  return Array.from({ length: count }, () => ({
+    x: rand(),
+    y: rand(),
+    r: rand() < 0.08 ? 1.3 : 0.7,
+    a: 0.18 + rand() * 0.5,
+  }));
+}
+
+const STARS = makeStars(240);
+
 function tileX(lng: number, z: number): number {
   return ((lng + 180) / 360) * 2 ** z;
 }
@@ -261,7 +289,10 @@ function GlobeViewInner({ signals, routes, selectedId, onSelect, jump }: Props) 
     const pointers = new Map<number, { x: number; y: number }>();
     let frame = 0;
     let dragged = 0;
-    let spin = false;
+    let spin = !reduced;
+    let hoverId: string | null = null;
+    let sun = sunVector(Date.now());
+    let sunAt = Date.now();
     let velLat = 0;
     let velLng = 0;
     let filtDx = 0;
@@ -473,11 +504,18 @@ function GlobeViewInner({ signals, routes, selectedId, onSelect, jump }: Props) 
         Math.abs(deltaLng(view.lng, aim.lng)) > 0.02 ||
         Math.abs(aim.zoom - view.zoom) > 0.012;
 
+      if (Date.now() - sunAt > 60_000) {
+        sunAt = Date.now();
+        sun = sunVector(sunAt);
+        dirty = true;
+      }
       const radius = radiusFor(view.zoom, w, h);
       const b = basis(view.lat, view.lng);
-      const movingCamera = interacting || gliding || Math.abs(velLat) > 0.004 || Math.abs(velLng) > 0.004 || spin;
+      const movingCamera = interacting || gliding || Math.abs(velLat) > 0.004 || Math.abs(velLng) > 0.004;
       const settling = performance.now() - tileClock < 220;
-      const stride = movingCamera || settling ? (w * h > 900000 ? 3 : 2) : 1;
+      // The idle spin is slow and the whole globe fits on screen, so it can afford full resolution.
+      const idleSpin = spin && !movingCamera && radius * radius * Math.PI < 700_000;
+      const stride = (movingCamera || spin || settling) && !idleSpin ? (w * h > 900000 ? 3 : 2) : 1;
       const bw = Math.max(2, Math.ceil(w / stride));
       const bh = Math.max(2, Math.ceil(h / stride));
       if (!terrain || terrain.width !== bw || terrain.height !== bh) {
@@ -498,6 +536,9 @@ function GlobeViewInner({ signals, routes, selectedId, onSelect, jump }: Props) 
         const pix = buf.data;
         const cx = w / 2;
         const cy = h / 2;
+        // Night shading fades out as you zoom in, so close-up imagery stays readable.
+        const night = clamp((3 - view.zoom) / 2, 0, 1) * 0.55;
+        const [sx0, sy0, sz0] = sun;
         const detail =
           radius > Math.min(w, h) * 0.72
             ? clamp(Math.round(Math.log2(((radius * Math.PI) / 180) * (360 / 256))), 3, 10)
@@ -547,9 +588,14 @@ function GlobeViewInner({ signals, routes, selectedId, onSelect, jump }: Props) 
             const lng = Math.atan2(wy, wx) * R2D;
             const color = sample(lat, lng, detail);
             const light = 0.78 + 0.22 * nz;
-            pix[i] = color[0] * light;
-            pix[i + 1] = color[1] * light;
-            pix[i + 2] = color[2] * light;
+            let dark = 0;
+            if (night > 0) {
+              const t = clamp((wx * sx0 + wy * sy0 + wz * sz0 + 0.1) / 0.2, 0, 1);
+              dark = night * (1 - t * t * (3 - 2 * t));
+            }
+            pix[i] = color[0] * light * (1 - dark);
+            pix[i + 1] = color[1] * light * (1 - dark * 0.9);
+            pix[i + 2] = color[2] * light * (1 - dark * 0.72);
             pix[i + 3] = 255;
           }
         }
@@ -559,13 +605,25 @@ function GlobeViewInner({ signals, routes, selectedId, onSelect, jump }: Props) 
 
       ctx.fillStyle = "#071016";
       ctx.fillRect(0, 0, w, h);
+      if (radius < Math.hypot(w, h) * 0.5) {
+        const drift = view.lng / 360;
+        ctx.fillStyle = "#cfe9e3";
+        for (const star of STARS) {
+          const x = (((star.x - drift * 0.18) % 1) + 1) % 1;
+          ctx.globalAlpha = star.a;
+          ctx.fillRect(x * w, star.y * h, star.r, star.r);
+        }
+        ctx.globalAlpha = 1;
+      }
       if (radius < Math.min(w, h) * 0.72) {
-        const glow = ctx.createRadialGradient(w / 2, h / 2, radius * 0.92, w / 2, h / 2, radius * 1.14);
-        glow.addColorStop(0, "rgba(62,224,197,0)");
-        glow.addColorStop(1, "rgba(62,224,197,0.22)");
+        const glow = ctx.createRadialGradient(w / 2, h / 2, radius * 0.96, w / 2, h / 2, radius * 1.22);
+        glow.addColorStop(0, "rgba(62,224,197,0.34)");
+        glow.addColorStop(0.18, "rgba(62,224,197,0.16)");
+        glow.addColorStop(0.5, "rgba(62,224,197,0.05)");
+        glow.addColorStop(1, "rgba(62,224,197,0)");
         ctx.fillStyle = glow;
         ctx.beginPath();
-        ctx.arc(w / 2, h / 2, radius * 1.14, 0, Math.PI * 2);
+        ctx.arc(w / 2, h / 2, radius * 1.22, 0, Math.PI * 2);
         ctx.fill();
       }
       if (terrain) {
@@ -575,8 +633,8 @@ function GlobeViewInner({ signals, routes, selectedId, onSelect, jump }: Props) 
       if (radius < Math.hypot(w, h) * 0.55) {
         ctx.beginPath();
         ctx.arc(w / 2, h / 2, radius, 0, Math.PI * 2);
-        ctx.strokeStyle = "rgba(62,224,197,0.7)";
-        ctx.lineWidth = 1.5;
+        ctx.strokeStyle = "rgba(62,224,197,0.45)";
+        ctx.lineWidth = 1;
         ctx.stroke();
       }
 
@@ -610,6 +668,7 @@ function GlobeViewInner({ signals, routes, selectedId, onSelect, jump }: Props) 
           moving: Boolean(live),
           kind: signal.kind,
           name: signal.name,
+          common: signal.common,
           heading: legs.get(signal.id)?.heading ?? null,
           fresh: Date.now() - Date.parse(signal.observedAt) < 120 * 86_400_000,
         };
@@ -705,6 +764,43 @@ function GlobeViewInner({ signals, routes, selectedId, onSelect, jump }: Props) 
         ctx.fillText(text, left, p.y);
         labeled.push(p);
       }
+      const hovered = hoverId ? dots.find((dot) => dot.id === hoverId) : null;
+      if (hovered && hovered.id !== selectedRef.current) {
+        const p = put(hovered.lat, hovered.lng);
+        if (p) {
+          const title = hovered.name.length > 28 ? `${hovered.name.slice(0, 27)}…` : hovered.name;
+          const sub = `${hovered.kind === "tag" ? "Tag" : "Sighting"} · ${hovered.common}`;
+          const line2 = sub.length > 34 ? `${sub.slice(0, 33)}…` : sub;
+          ctx.font = "600 13px IBM Plex Mono, ui-monospace, monospace";
+          const tw1 = ctx.measureText(title).width;
+          ctx.font = "400 11px IBM Plex Mono, ui-monospace, monospace";
+          const tw2 = ctx.measureText(line2).width;
+          const bw2 = Math.max(tw1, tw2) + 20;
+          const bh2 = 44;
+          let left = p.x + 14;
+          let top = p.y - bh2 - 10;
+          if (left + bw2 > w - 8) left = p.x - bw2 - 14;
+          if (top < 8) top = p.y + 12;
+          ctx.fillStyle = "rgba(13,26,34,0.94)";
+          ctx.strokeStyle = COLORS[hovered.group];
+          ctx.lineWidth = 1;
+          ctx.beginPath();
+          ctx.roundRect(left, top, bw2, bh2, 8);
+          ctx.fill();
+          ctx.stroke();
+          ctx.textBaseline = "alphabetic";
+          ctx.fillStyle = "#e7f4f1";
+          ctx.font = "600 13px IBM Plex Mono, ui-monospace, monospace";
+          ctx.fillText(title, left + 10, top + 18);
+          ctx.fillStyle = "#8aa39c";
+          ctx.font = "400 11px IBM Plex Mono, ui-monospace, monospace";
+          ctx.fillText(line2, left + 10, top + 35);
+          ctx.beginPath();
+          ctx.strokeStyle = "#f4fff8";
+          ctx.arc(p.x, p.y, 9, 0, Math.PI * 2);
+          ctx.stroke();
+        }
+      }
       hitsRef.current = hits;
       frame = requestAnimationFrame(paint);
     };
@@ -743,9 +839,36 @@ function GlobeViewInner({ signals, routes, selectedId, onSelect, jump }: Props) 
         /* pointer already gone */
       }
     };
+    const nearest = (clientX: number, clientY: number, reach: number): Hit | null => {
+      const rect = canvas.getBoundingClientRect();
+      const x = clientX - rect.left;
+      const y = clientY - rect.top;
+      let best: Hit | null = null;
+      let bestD = reach;
+      for (const hit of hitsRef.current) {
+        const d = Math.hypot(hit.x - x, hit.y - y);
+        if (d < bestD) {
+          best = hit;
+          bestD = d;
+        }
+      }
+      return best;
+    };
     const move = (event: PointerEvent) => {
       const prev = pointers.get(event.pointerId);
-      if (!prev) return;
+      if (!prev) {
+        if (event.pointerType !== "mouse") return;
+        const next = nearest(event.clientX, event.clientY, 16)?.id ?? null;
+        if (next !== hoverId) {
+          hoverId = next;
+          canvas.style.cursor = next ? "pointer" : "";
+        }
+        return;
+      }
+      if (hoverId) {
+        hoverId = null;
+        canvas.style.cursor = "";
+      }
       pointers.set(event.pointerId, { x: event.clientX, y: event.clientY });
       if (event.cancelable) event.preventDefault();
       const pair = pinchPair();
@@ -795,19 +918,12 @@ function GlobeViewInner({ signals, routes, selectedId, onSelect, jump }: Props) 
     };
     const click = (event: MouseEvent) => {
       if (dragged > 8) return;
-      const rect = canvas.getBoundingClientRect();
-      const x = event.clientX - rect.left;
-      const y = event.clientY - rect.top;
-      let best: Hit | null = null;
-      let bestD = 28;
-      for (const hit of hitsRef.current) {
-        const d = Math.hypot(hit.x - x, hit.y - y);
-        if (d < bestD) {
-          best = hit;
-          bestD = d;
-        }
-      }
+      const best = nearest(event.clientX, event.clientY, 28);
       if (best) onSelectRef.current(best.id);
+    };
+    const leave = () => {
+      hoverId = null;
+      canvas.style.cursor = "";
     };
     const wheel = (event: WheelEvent) => {
       if (event.target instanceof Element && event.target.closest("button")) return;
@@ -828,6 +944,7 @@ function GlobeViewInner({ signals, routes, selectedId, onSelect, jump }: Props) 
     canvas.addEventListener("pointerup", up);
     canvas.addEventListener("pointercancel", up);
     canvas.addEventListener("click", click);
+    canvas.addEventListener("pointerleave", leave);
     wrap.addEventListener("wheel", wheel, { passive: false });
 
     return () => {
@@ -838,6 +955,7 @@ function GlobeViewInner({ signals, routes, selectedId, onSelect, jump }: Props) 
       canvas.removeEventListener("pointerup", up);
       canvas.removeEventListener("pointercancel", up);
       canvas.removeEventListener("click", click);
+      canvas.removeEventListener("pointerleave", leave);
       wrap.removeEventListener("wheel", wheel);
     };
   }, []);

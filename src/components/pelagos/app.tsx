@@ -1,7 +1,16 @@
-import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { ChevronDown, RefreshCw, Search } from "lucide-react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState, type RefObject } from "react";
+import { Check, ChevronDown, Dices, Link2, RefreshCw, Search, X } from "lucide-react";
 import { getLiveRoutes, getSignals, getTrack } from "@/lib/ocean.functions";
-import type { Feed, Group, Kind, LiveRoute, Signal, Track, TrackPoint } from "@/lib/ocean.types";
+import type {
+  Feed,
+  Group,
+  Kind,
+  LiveRoute,
+  Signal,
+  SourceStatus,
+  Track,
+  TrackPoint,
+} from "@/lib/ocean.types";
 import { GlobeView, trackLeg } from "./globe";
 
 type WindowKey = "48h" | "30d" | "90d" | "all";
@@ -77,7 +86,22 @@ function pathKm(points: TrackPoint[]): number {
   return sum;
 }
 
-export function PelagosApp() {
+type FeedHealth = "loading" | "ok" | "partial" | "down";
+
+function feedHealth(feed: Feed | null, loading: boolean, error: string | null): FeedHealth {
+  if (!feed) return loading ? "loading" : "down";
+  const up = feed.sources.filter((source) => source.ok).length;
+  if (error || up === 0) return feed.signals.length ? "partial" : "down";
+  return up < feed.sources.length ? "partial" : "ok";
+}
+
+export function PelagosApp({
+  focusId = null,
+  onFocusChange,
+}: {
+  focusId?: string | null;
+  onFocusChange?: (id: string | null) => void;
+}) {
   const [feed, setFeed] = useState<Feed | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
@@ -86,7 +110,7 @@ export function PelagosApp() {
   const [kind, setKind] = useState<Kind | "all">("tag");
   const [query, setQuery] = useState("");
   const [menuOpen, setMenuOpen] = useState(false);
-  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [selectedId, setSelectedId] = useState<string | null>(focusId);
   const [track, setTrack] = useState<Track | null>(null);
   const [trackState, setTrackState] = useState<"idle" | "loading" | "ready" | "error">("idle");
   const [now, setNow] = useState<number | null>(null);
@@ -94,6 +118,7 @@ export function PelagosApp() {
   const [jump, setJump] = useState<{ id: number; lat: number; lng: number; zoom: number } | null>(null);
   const jumpN = useRef(0);
   const menuRef = useRef<HTMLDivElement | null>(null);
+  const searchRef = useRef<HTMLInputElement | null>(null);
 
   const load = useCallback(async (fresh: boolean) => {
     try {
@@ -144,6 +169,33 @@ export function PelagosApp() {
     };
     window.addEventListener("pointerdown", close);
     return () => window.removeEventListener("pointerdown", close);
+  }, [menuOpen]);
+
+  useEffect(() => {
+    if (selectedId !== focusId) onFocusChange?.(selectedId);
+    // focusId mirrors selectedId through the URL; only the local choice drives this.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedId]);
+
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      const target = event.target as HTMLElement | null;
+      const typing = target?.closest("input, textarea, [contenteditable='true']");
+      if (event.key === "Escape") {
+        if (menuOpen) setMenuOpen(false);
+        else setSelectedId(null);
+        if (typing) target?.blur();
+        return;
+      }
+      if (typing || event.metaKey || event.ctrlKey || event.altKey) return;
+      if (event.key === "/") {
+        event.preventDefault();
+        setMenuOpen(true);
+        window.setTimeout(() => searchRef.current?.focus(), 0);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
   }, [menuOpen]);
 
   const visible = useMemo(() => {
@@ -219,6 +271,23 @@ export function PelagosApp() {
     setMenuOpen(false);
   }, []);
 
+  const surprise = useCallback(() => {
+    const live = new Set(routes.map((route) => route.id));
+    const stamp = Date.now();
+    const pool = (feed?.signals ?? []).filter(
+      (signal) =>
+        signal.kind === "tag" &&
+        groups[signal.group] &&
+        signal.id !== selectedId &&
+        stamp - Date.parse(signal.observedAt) < 120 * 86_400_000,
+    );
+    const moving = pool.filter((signal) => live.has(signal.id));
+    const picks = moving.length ? moving : pool;
+    if (!picks.length) return;
+    setSelectedId(picks[Math.floor(Math.random() * picks.length)].id);
+    setMenuOpen(false);
+  }, [feed, routes, groups, selectedId]);
+
   const goOcean = useCallback((ocean: (typeof OCEANS)[number]) => {
     jumpN.current += 1;
     setJump({ id: jumpN.current, lat: ocean.lat, lng: ocean.lng, zoom: ocean.zoom });
@@ -248,6 +317,7 @@ export function PelagosApp() {
     })
     .slice(0, 160);
   const movingCount = globeRoutes.length;
+  const health = feedHealth(feed, loading, error);
   const recentTags = useMemo(() => {
     const stamp = now ?? Date.now();
     return visible.filter(
@@ -282,6 +352,11 @@ export function PelagosApp() {
                 onClick={() => setMenuOpen((open) => !open)}
               >
                 Signals
+                {feed ? (
+                  <span className="rounded-full bg-surface-2 px-2 py-0.5 text-xs text-muted tabular-nums">
+                    {visible.length}
+                  </span>
+                ) : null}
                 <ChevronDown className={`size-4 text-phosphor ${menuOpen ? "rotate-180" : ""}`} />
               </button>
             </div>
@@ -312,6 +387,9 @@ export function PelagosApp() {
                 query={query}
                 loading={loading}
                 error={error}
+                sources={feed?.sources ?? []}
+                fetchedAt={feed?.fetchedAt ?? null}
+                searchRef={searchRef}
                 now={now}
                 selectedId={selectedId}
                 motion={motion}
@@ -335,12 +413,25 @@ export function PelagosApp() {
             trackState={trackState}
             moving={globeRoutes.some((route) => route.id === selected.id)}
             now={now}
+            onNext={surprise}
             onRelease={() => setSelectedId(null)}
           />
         </aside>
       ) : (
         <div className="dock">
-          <Layers kind={kind} onKind={setKind} />
+          <div className="dock-row">
+            <Layers kind={kind} onKind={setKind} />
+            <button
+              type="button"
+              className="surprise hud-panel"
+              onClick={surprise}
+              disabled={!feed?.signals.some((signal) => signal.kind === "tag")}
+              aria-label="Fly to a random tagged animal"
+            >
+              <Dices className="size-4" aria-hidden="true" />
+              <span className="surprise-label">Random</span>
+            </button>
+          </div>
           <div className="legend hud-panel pointer-events-none px-3 py-2 font-mono text-xs text-fg">
             <span className="inline-flex items-center gap-1">
               <i className="size-2.5 rounded-full bg-whale" /> Whales
@@ -351,10 +442,16 @@ export function PelagosApp() {
             <span className="inline-flex items-center gap-1">
               <i className="size-2.5 rounded-full bg-dolphin" /> Dolphins
             </span>
-            <span className="text-muted">
-              {movingCount
-                ? `${movingCount} tags · ${recentTags} pinged lately`
-                : "Loading tracks"}
+            <span className={health === "down" ? "text-shark" : "text-muted"}>
+              {health === "loading"
+                ? "Sweeping the basins…"
+                : health === "down"
+                  ? "Feeds unreachable · retrying"
+                  : movingCount
+                    ? `${movingCount} tags · ${recentTags} pinged lately`
+                    : recentTags
+                      ? `${recentTags} tags pinged lately`
+                      : "Plotting tracks…"}
             </span>
           </div>
         </div>
@@ -442,6 +539,9 @@ const ListPane = memo(function ListPane({
   query,
   loading,
   error,
+  sources,
+  fetchedAt,
+  searchRef,
   now,
   selectedId,
   motion,
@@ -460,6 +560,9 @@ const ListPane = memo(function ListPane({
   query: string;
   loading: boolean;
   error: string | null;
+  sources: SourceStatus[];
+  fetchedAt: string | null;
+  searchRef: RefObject<HTMLInputElement | null>;
   now: number | null;
   selectedId: string | null;
   motion: Map<string, { kmh: number; dir: string }>;
@@ -475,6 +578,7 @@ const ListPane = memo(function ListPane({
       <div className="flex items-center justify-between gap-2 border-b border-line px-3 py-2">
         <p className="font-mono text-xs text-muted">
           {loading ? "Sweeping the basins…" : `${total} signals`}
+          {!loading && fetchedAt && now ? ` · updated ${ageLabel(fetchedAt, now)}` : ""}
         </p>
         <button
           type="button"
@@ -502,49 +606,77 @@ const ListPane = memo(function ListPane({
             </button>
           ))}
         </div>
-        <div className="mt-2 flex flex-wrap gap-2">
-          {WINDOWS.map((item) => (
-            <button
-              key={item.id}
-              type="button"
-              aria-pressed={windowKey === item.id}
-              onClick={() => onWindow(item.id)}
-              className={`min-h-11 rounded-full border px-3 font-mono text-xs ${
-                windowKey === item.id ? "border-phosphor text-phosphor" : "border-line text-muted"
-              }`}
-            >
-              {item.label}
-            </button>
-          ))}
-          {(["all", "tag", "sighting"] as const).map((item) => (
-            <button
-              key={item}
-              type="button"
-              aria-pressed={kind === item}
-              onClick={() => onKind(item)}
-              className={`min-h-11 rounded-full border px-3 font-mono text-xs ${
-                kind === item ? "border-line bg-surface-2 text-fg" : "border-line text-muted"
-              }`}
-            >
-              {item === "all" ? "All" : item === "tag" ? "Live" : "Seen"}
-            </button>
-          ))}
+        <div className="mt-3 flex items-center gap-2">
+          <span className="w-12 shrink-0 font-mono text-xs text-muted">Since</span>
+          <div className="flex flex-1 flex-wrap gap-1.5" role="group" aria-label="Time window">
+            {WINDOWS.map((item) => (
+              <button
+                key={item.id}
+                type="button"
+                aria-pressed={windowKey === item.id}
+                onClick={() => onWindow(item.id)}
+                className={`min-h-11 flex-1 rounded-full border px-2 font-mono text-xs ${
+                  windowKey === item.id ? "border-phosphor text-phosphor" : "border-line text-muted"
+                }`}
+              >
+                {item.id === "all" ? "Any" : item.label}
+              </button>
+            ))}
+          </div>
+        </div>
+        <div className="mt-2 flex items-center gap-2">
+          <span className="w-12 shrink-0 font-mono text-xs text-muted">Show</span>
+          <div className="flex flex-1 flex-wrap gap-1.5" role="group" aria-label="Signal type">
+            {(["tag", "sighting", "all"] as const).map((item) => (
+              <button
+                key={item}
+                type="button"
+                aria-pressed={kind === item}
+                onClick={() => onKind(item)}
+                className={`min-h-11 flex-1 rounded-full border px-2 font-mono text-xs ${
+                  kind === item ? "border-phosphor text-phosphor" : "border-line text-muted"
+                }`}
+              >
+                {item === "all" ? "Both" : item === "tag" ? "Tags" : "Sightings"}
+              </button>
+            ))}
+          </div>
         </div>
         <label className="mt-3 flex min-h-11 items-center gap-2 rounded-full border border-line px-3">
           <Search className="size-4 shrink-0 text-muted" aria-hidden="true" />
           <input
+            ref={searchRef}
             value={query}
             onChange={(event) => onQuery(event.target.value)}
             placeholder="Name, species, place"
             className="w-full bg-transparent font-mono text-sm text-fg outline-none placeholder:text-muted"
             type="search"
+            aria-label="Search signals"
           />
+          {query ? (
+            <button
+              type="button"
+              className="grid size-8 shrink-0 place-items-center text-muted hover:text-fg"
+              onClick={() => onQuery("")}
+              aria-label="Clear search"
+            >
+              <X className="size-4" />
+            </button>
+          ) : (
+            <kbd className="hidden shrink-0 rounded border border-line px-1.5 text-xs text-muted md:inline">/</kbd>
+          )}
         </label>
       </div>
       <div className="min-h-0 flex-1 overflow-y-auto">
         {error ? <p className="px-3 py-3 font-mono text-xs text-shark">{error}</p> : null}
         {!loading && list.length === 0 ? (
-          <p className="px-3 py-6 font-mono text-sm text-muted">Nothing in this window.</p>
+          <p className="px-3 py-6 font-mono text-sm text-muted">
+            {query
+              ? `Nothing matches “${query.trim()}”. Try a species or a place.`
+              : sources.length && sources.every((source) => !source.ok)
+                ? "The tracking feeds are not answering right now. FinScape retries every 45 seconds."
+                : "Nothing in this window. Widen the time range or switch layers."}
+          </p>
         ) : (
           <ul>
             {list.map((signal) => {
@@ -588,6 +720,20 @@ const ListPane = memo(function ListPane({
           </ul>
         )}
       </div>
+      {sources.length ? (
+        <ul className="space-y-1 border-t border-line px-3 py-2 font-mono text-xs text-muted">
+          {sources.map((source) => (
+            <li key={source.id} className="flex items-start gap-2" title={source.note ?? undefined}>
+              <span
+                className={`mt-1.5 size-1.5 shrink-0 rounded-full ${source.ok ? "bg-phosphor" : "bg-shark"}`}
+                aria-hidden="true"
+              />
+              <span className="min-w-0 flex-1 truncate">{source.label}</span>
+              <span className="shrink-0 tabular-nums">{source.ok ? source.count : "offline"}</span>
+            </li>
+          ))}
+        </ul>
+      ) : null}
     </>
   );
 });
@@ -598,6 +744,7 @@ function Dossier({
   trackState,
   moving,
   now,
+  onNext,
   onRelease,
 }: {
   signal: Signal;
@@ -605,19 +752,78 @@ function Dossier({
   trackState: "idle" | "loading" | "ready" | "error";
   moving: boolean;
   now: number | null;
+  onNext: () => void;
   onRelease: () => void;
 }) {
+  const [copied, setCopied] = useState(false);
+  const [photoOk, setPhotoOk] = useState(true);
+  useEffect(() => {
+    setCopied(false);
+    setPhotoOk(true);
+  }, [signal.id]);
+  const share = async () => {
+    const url = window.location.href;
+    try {
+      if (navigator.share && window.matchMedia("(pointer: coarse)").matches) {
+        await navigator.share({ title: `${signal.name} on FinScape`, url });
+        return;
+      }
+      await navigator.clipboard.writeText(url);
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1800);
+    } catch {
+      /* share sheet dismissed or clipboard blocked */
+    }
+  };
+  const photo = photoOk && signal.image && /^https?:\/\//.test(signal.image) ? signal.image : null;
   const points = track?.points ?? [];
   const km = points.length > 1 ? Math.round(pathKm(points)) : null;
   const leg = trackLeg(points);
   return (
     <div>
-      <div className="flex items-center justify-between gap-2 border-b border-line px-3 py-2">
+      <div className="sticky top-0 z-10 flex items-center justify-between gap-1 border-b border-line bg-surface px-3 py-1">
         <p className="font-mono text-xs tracking-widest text-phosphor">LOCK</p>
-        <button type="button" className="min-h-11 font-mono text-xs text-muted hover:text-fg" onClick={onRelease}>
-          Release
-        </button>
+        <div className="flex items-center">
+          <button
+            type="button"
+            className="inline-flex min-h-11 items-center gap-1.5 px-2 font-mono text-xs text-muted hover:text-fg"
+            onClick={() => void share()}
+          >
+            {copied ? <Check className="size-3.5 text-phosphor" /> : <Link2 className="size-3.5" />}
+            {copied ? "Copied" : "Share"}
+          </button>
+          {signal.kind === "tag" ? (
+            <button
+              type="button"
+              className="inline-flex min-h-11 items-center gap-1.5 px-2 font-mono text-xs text-muted hover:text-fg"
+              onClick={onNext}
+              aria-label="Fly to another random tag"
+            >
+              <Dices className="size-3.5" />
+              Next
+            </button>
+          ) : null}
+          <button
+            type="button"
+            className="inline-flex min-h-11 items-center gap-1.5 px-2 font-mono text-xs text-muted hover:text-fg"
+            onClick={onRelease}
+            aria-label="Release (Esc)"
+          >
+            <X className="size-3.5" />
+            Release
+          </button>
+        </div>
       </div>
+      {photo ? (
+        <img
+          src={photo}
+          alt={`${signal.name}, ${signal.common}`}
+          className="dossier-photo"
+          loading="lazy"
+          referrerPolicy="no-referrer"
+          onError={() => setPhotoOk(false)}
+        />
+      ) : null}
       <div className="space-y-3 px-4 py-3">
         <div>
           <p className="font-mono text-xs uppercase tracking-widest text-muted">
@@ -638,6 +844,8 @@ function Dossier({
           <Fact label="Longitude" value={signal.lng.toFixed(3)} />
           {signal.sex ? <Fact label="Sex" value={signal.sex} /> : null}
           {signal.length ? <Fact label="Length" value={signal.length} /> : null}
+          {signal.weight ? <Fact label="Weight" value={signal.weight} /> : null}
+          {signal.stage ? <Fact label="Life stage" value={signal.stage} /> : null}
           {signal.place ? <Fact label={signal.kind === "tag" ? "Tagged" : "Place"} value={signal.place} /> : null}
         </dl>
         <p className="font-mono text-xs text-muted">
