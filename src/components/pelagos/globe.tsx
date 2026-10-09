@@ -1,5 +1,6 @@
 import { memo, useEffect, useRef } from "react";
 import { Minus, Plus } from "lucide-react";
+import { EARTH_URL, TILES_CROSS_ORIGIN, tileUrl } from "@/lib/assets";
 import type { Group, LiveRoute, Signal, TrackPoint } from "@/lib/ocean.types";
 
 const COLORS: Record<Group, string> = {
@@ -276,7 +277,7 @@ function GlobeViewInner({ signals, routes, selectedId, onSelect, jump }: Props) 
     if (!ctx) return;
 
     const earth = new Image();
-    earth.src = "/earth.jpg";
+    earth.src = EARTH_URL;
     let earthPx: Uint8ClampedArray | null = null;
     let earthW = 0;
     let earthH = 0;
@@ -347,14 +348,19 @@ function GlobeViewInner({ signals, routes, selectedId, onSelect, jump }: Props) 
         const ictx = scratch.getContext("2d", { willReadFrequently: true });
         if (!ictx) return;
         ictx.drawImage(img, 0, 0);
-        created.pixels = ictx.getImageData(0, 0, scratch.width, scratch.height).data;
+        try {
+          created.pixels = ictx.getImageData(0, 0, scratch.width, scratch.height).data;
+        } catch {
+          return; // a tile served without CORS stays unreadable; the base texture covers it
+        }
         created.w = scratch.width;
         created.h = scratch.height;
         created.ready = true;
         tileClock = performance.now();
         dirty = true;
       };
-      img.src = `/api/sat/${z}/${y}/${wrapped}`;
+      if (TILES_CROSS_ORIGIN) img.crossOrigin = "anonymous";
+      img.src = tileUrl(z, y, wrapped);
       tiles.set(key, created);
       if (tiles.size > 180) {
         const oldest = tiles.keys().next().value;
@@ -622,10 +628,11 @@ function GlobeViewInner({ signals, routes, selectedId, onSelect, jump }: Props) 
             let shine = 0;
             if (glint > 0 && color[2] > color[0] + 8 && color[2] >= color[1]) {
               const d = wx * hx + wy * hy + wz * hz;
-              if (d > 0.9) {
-                const d2 = d * d;
-                const d8 = d2 * d2 * d2 * d2;
-                shine = d8 * d8 * d8 * d8 * glint * 120;
+              if (d > 0.97) {
+                const d4 = d * d * d * d;
+                const d16 = d4 * d4 * d4 * d4;
+                const d64 = d16 * d16 * d16 * d16;
+                shine = d64 * d64 * glint * 85;
               }
             }
             pix[i] = color[0] * light * (1 - dark) + shine;

@@ -1,0 +1,3 @@
+/* The Pages build is rooted in pages/, so point Tailwind at the app source for class names. */
+@import "../src/styles.css";
+@source "../src";

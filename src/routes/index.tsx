@@ -1,13 +1,14 @@
 import { useCallback } from "react";
 import { createFileRoute, useNavigate } from "@tanstack/react-router";
 import { PelagosApp } from "@/components/pelagos/app";
+import { parseFocus } from "@/lib/focus";
 
 type Search = { a?: string };
 
 export const Route = createFileRoute("/")({
   validateSearch: (search: Record<string, unknown>): Search => {
-    const raw = typeof search.a === "string" ? search.a.trim() : "";
-    return /^((ocearch|inat):\d{1,12}|whoi:[a-z0-9_-]{1,80})$/.test(raw) ? { a: raw } : {};
+    const a = parseFocus(search.a);
+    return a ? { a } : {};
   },
   component: Home,
 });
