@@ -40,6 +40,8 @@ export type Signal = {
   tagId: number | null;
   /** The source's own words about this record, e.g. a spotter's report. */
   note?: string | null;
+  /** Who recorded it, e.g. the iNaturalist observer. */
+  credit?: string | null;
   heard?: Heard | null;
 };
 

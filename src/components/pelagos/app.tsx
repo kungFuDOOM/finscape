@@ -1,5 +1,5 @@
-import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { ChevronDown, RefreshCw, Search } from "lucide-react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState, type RefObject } from "react";
+import { Check, ChevronDown, Dices, Link2, RefreshCw, Search, X } from "lucide-react";
 import { loadFeed, loadRoutes, loadTrack } from "@/lib/feed-client";
 import type {
   CallStatus,
@@ -146,7 +146,14 @@ function pathKm(points: TrackPoint[]): number {
   return sum;
 }
 
-export function PelagosApp() {
+export function PelagosApp({
+  focusId = null,
+  onFocusChange,
+}: {
+  /** Signal to open on load, from a shared `?a=` link. */
+  focusId?: string | null;
+  onFocusChange?: (id: string | null) => void;
+}) {
   const [feed, setFeed] = useState<Feed | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
@@ -155,7 +162,8 @@ export function PelagosApp() {
     shark: true,
     dolphin: true,
   });
-  const [windowKey, setWindowKey] = useState<WindowKey>("all");
+  // Most tags went quiet long ago; open on recent activity and keep the archive one tap away.
+  const [windowKey, setWindowKey] = useState<WindowKey>("90d");
   const [layers, setLayers] = useState<Record<Kind, boolean>>({
     tag: true,
     heard: true,
@@ -163,7 +171,7 @@ export function PelagosApp() {
   });
   const [query, setQuery] = useState("");
   const [menuOpen, setMenuOpen] = useState(false);
-  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [selectedId, setSelectedId] = useState<string | null>(focusId);
   const [track, setTrack] = useState<Track | null>(null);
   const [trackState, setTrackState] = useState<"idle" | "loading" | "ready" | "error">("idle");
   const [now, setNow] = useState<number | null>(null);
@@ -173,6 +181,7 @@ export function PelagosApp() {
   );
   const jumpN = useRef(0);
   const menuRef = useRef<HTMLDivElement | null>(null);
+  const searchRef = useRef<HTMLInputElement | null>(null);
 
   const load = useCallback(async (fresh: boolean) => {
     try {
@@ -223,6 +232,33 @@ export function PelagosApp() {
     };
     window.addEventListener("pointerdown", close);
     return () => window.removeEventListener("pointerdown", close);
+  }, [menuOpen]);
+
+  useEffect(() => {
+    if (selectedId !== focusId) onFocusChange?.(selectedId);
+    // focusId mirrors selectedId through the URL; only the local choice drives this.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedId]);
+
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      const target = event.target as HTMLElement | null;
+      const typing = target?.closest("input, textarea, [contenteditable='true']");
+      if (event.key === "Escape") {
+        if (menuOpen) setMenuOpen(false);
+        else setSelectedId(null);
+        if (typing) target?.blur();
+        return;
+      }
+      if (typing || event.metaKey || event.ctrlKey || event.altKey) return;
+      if (event.key === "/") {
+        event.preventDefault();
+        setMenuOpen(true);
+        window.setTimeout(() => searchRef.current?.focus(), 0);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
   }, [menuOpen]);
 
   const visible = useMemo(() => {
@@ -308,6 +344,24 @@ export function PelagosApp() {
     setMenuOpen(false);
   }, []);
 
+  /** Fly to a random recently active tag, preferring ones with a moving track. */
+  const surprise = useCallback(() => {
+    const live = new Set(routes.map((route) => route.id));
+    const stamp = Date.now();
+    const candidates = (feed?.signals ?? []).filter(
+      (signal) =>
+        signal.kind === "tag" &&
+        groups[signal.group] &&
+        signal.id !== selectedId &&
+        stamp - Date.parse(signal.observedAt) < 120 * DAY_MS,
+    );
+    const moving = candidates.filter((signal) => live.has(signal.id));
+    const picks = moving.length ? moving : candidates;
+    if (!picks.length) return;
+    setSelectedId(picks[Math.floor(Math.random() * picks.length)].id);
+    setMenuOpen(false);
+  }, [feed, routes, groups, selectedId]);
+
   const goOcean = useCallback((ocean: (typeof OCEANS)[number]) => {
     jumpN.current += 1;
     setJump({ id: jumpN.current, lat: ocean.lat, lng: ocean.lng, zoom: ocean.zoom });
@@ -354,6 +408,10 @@ export function PelagosApp() {
   const selectedRoute = selected
     ? (globeRoutes.find((route) => route.id === selected.id) ?? null)
     : null;
+  const feedsDown =
+    !loading &&
+    !feed?.signals.length &&
+    (Boolean(error) || (feed?.sources ?? []).every((source) => !source.ok));
 
   return (
     <main className={`relative h-dvh overflow-hidden bg-bg text-fg${selected ? " has-lock" : ""}`}>
@@ -382,6 +440,11 @@ export function PelagosApp() {
                 onClick={() => setMenuOpen((open) => !open)}
               >
                 Signals
+                {feed ? (
+                  <span className="rounded-full bg-surface-2 px-2 py-0.5 text-xs text-muted tabular-nums">
+                    {visible.length}
+                  </span>
+                ) : null}
                 <ChevronDown className={`size-4 text-phosphor ${menuOpen ? "rotate-180" : ""}`} />
               </button>
             </div>
@@ -421,6 +484,7 @@ export function PelagosApp() {
                 now={now}
                 fetchedAt={feed?.fetchedAt ?? null}
                 sources={feed?.sources ?? []}
+                searchRef={searchRef}
                 selectedId={selectedId}
                 motion={motion}
                 onQuery={setQuery}
@@ -444,16 +508,29 @@ export function PelagosApp() {
             trackState={selected.tagId ? trackState : "ready"}
             moving={Boolean(selectedRoute)}
             now={now}
+            onNext={surprise}
             onRelease={() => setSelectedId(null)}
           />
         </aside>
       ) : (
         <div className="dock">
           <Pulse items={pulse} now={now} onSelect={choose} />
-          <Layers
-            layers={layers}
-            onLayer={(id) => setLayers((prev) => ({ ...prev, [id]: !prev[id] }))}
-          />
+          <div className="dock-row">
+            <Layers
+              layers={layers}
+              onLayer={(id) => setLayers((prev) => ({ ...prev, [id]: !prev[id] }))}
+            />
+            <button
+              type="button"
+              className="surprise hud-panel"
+              onClick={surprise}
+              disabled={!feed?.signals.some((signal) => signal.kind === "tag")}
+              aria-label="Fly to a random tagged animal"
+            >
+              <Dices className="size-4" aria-hidden="true" />
+              <span>Random</span>
+            </button>
+          </div>
           <div className="legend hud-panel pointer-events-none px-3 py-2 font-mono text-xs text-fg">
             {GROUPS.map((group) => (
               <span key={group.id} className="inline-flex items-center gap-1">
@@ -463,10 +540,12 @@ export function PelagosApp() {
             <span className="inline-flex items-center gap-1">
               <i className="heard-ring" /> Hydrophone
             </span>
-            <span className="text-muted">
+            <span className={feedsDown ? "text-shark" : "text-muted"}>
               {loading
                 ? "Sweeping the basins…"
-                : `${summary.pinged} tags pinged this week · ${summary.hearing} hydrophones hearing whales`}
+                : feedsDown
+                  ? "Feeds unreachable · retrying"
+                  : `${summary.pinged} tags pinged this week · ${summary.hearing} hydrophones hearing whales`}
             </span>
           </div>
         </div>
@@ -598,6 +677,7 @@ const ListPane = memo(function ListPane({
   now,
   fetchedAt,
   sources,
+  searchRef,
   selectedId,
   motion,
   onQuery,
@@ -618,6 +698,7 @@ const ListPane = memo(function ListPane({
   now: number | null;
   fetchedAt: string | null;
   sources: SourceStatus[];
+  searchRef: RefObject<HTMLInputElement | null>;
   selectedId: string | null;
   motion: Map<string, { kmh: number; dir: string }>;
   onQuery: (value: string) => void;
@@ -692,18 +773,40 @@ const ListPane = memo(function ListPane({
         <label className="mt-3 flex min-h-11 items-center gap-2 rounded-full border border-line px-3">
           <Search className="size-4 shrink-0 text-muted" aria-hidden="true" />
           <input
+            ref={searchRef}
             value={query}
             onChange={(event) => onQuery(event.target.value)}
             placeholder="Name, species, place"
             className="w-full bg-transparent font-mono text-sm text-fg outline-none placeholder:text-muted"
             type="search"
+            aria-label="Search signals"
           />
+          {query ? (
+            <button
+              type="button"
+              className="grid size-8 shrink-0 place-items-center text-muted hover:text-fg"
+              onClick={() => onQuery("")}
+              aria-label="Clear search"
+            >
+              <X className="size-4" />
+            </button>
+          ) : (
+            <kbd className="hidden shrink-0 rounded border border-line px-1.5 text-xs text-muted md:inline">
+              /
+            </kbd>
+          )}
         </label>
       </div>
       <div className="min-h-0 flex-1 overflow-y-auto">
         {error ? <p className="px-3 py-3 font-mono text-xs text-shark">{error}</p> : null}
         {!loading && list.length === 0 ? (
-          <p className="px-3 py-6 font-mono text-sm text-muted">Nothing in this window.</p>
+          <p className="px-3 py-6 font-mono text-sm text-muted">
+            {query
+              ? `Nothing matches “${query.trim()}”. Try a species or a place.`
+              : sources.length && sources.every((source) => !source.ok)
+                ? "The tracking feeds are not answering right now. FinScape retries every 45 seconds."
+                : "Nothing in this window. Widen the time range or switch layers on."}
+          </p>
         ) : (
           <ul>
             {list.map((signal) => {
@@ -798,6 +901,7 @@ function Dossier({
   trackState,
   moving,
   now,
+  onNext,
   onRelease,
 }: {
   signal: Signal;
@@ -806,8 +910,30 @@ function Dossier({
   trackState: "idle" | "loading" | "ready" | "error";
   moving: boolean;
   now: number | null;
+  onNext: () => void;
   onRelease: () => void;
 }) {
+  const [copied, setCopied] = useState(false);
+  const [photoOk, setPhotoOk] = useState(true);
+  useEffect(() => {
+    setCopied(false);
+    setPhotoOk(true);
+  }, [signal.id]);
+  const share = async () => {
+    const url = window.location.href;
+    try {
+      if (navigator.share && window.matchMedia("(pointer: coarse)").matches) {
+        await navigator.share({ title: `${signal.name} on FinScape`, url });
+        return;
+      }
+      await navigator.clipboard.writeText(url);
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1800);
+    } catch {
+      /* share sheet dismissed or clipboard blocked */
+    }
+  };
+  const photo = photoOk && signal.image && /^https?:\/\//.test(signal.image) ? signal.image : null;
   const km = points.length > 1 ? Math.round(pathKm(points)) : null;
   // A heading from a fix weeks old says nothing about where the animal is going now.
   const stale = now !== null && now - Date.parse(signal.observedAt) > 7 * DAY_MS;
@@ -832,16 +958,49 @@ function Dossier({
           : "satellite tag";
   return (
     <div>
-      <div className="flex items-center justify-between gap-2 border-b border-line px-3 py-2">
+      <div className="sticky top-0 z-10 flex items-center justify-between gap-1 border-b border-line bg-surface px-3 py-1">
         <p className="font-mono text-xs tracking-widest text-phosphor">LOCK</p>
-        <button
-          type="button"
-          className="min-h-11 font-mono text-xs text-muted hover:text-fg"
-          onClick={onRelease}
-        >
-          Release
-        </button>
+        <div className="flex items-center">
+          <button
+            type="button"
+            className="inline-flex min-h-11 items-center gap-1.5 px-2 font-mono text-xs text-muted hover:text-fg"
+            onClick={() => void share()}
+          >
+            {copied ? <Check className="size-3.5 text-phosphor" /> : <Link2 className="size-3.5" />}
+            {copied ? "Copied" : "Share"}
+          </button>
+          {signal.kind === "tag" ? (
+            <button
+              type="button"
+              className="inline-flex min-h-11 items-center gap-1.5 px-2 font-mono text-xs text-muted hover:text-fg"
+              onClick={onNext}
+              aria-label="Fly to another random tag"
+            >
+              <Dices className="size-3.5" />
+              Next
+            </button>
+          ) : null}
+          <button
+            type="button"
+            className="inline-flex min-h-11 items-center gap-1.5 px-2 font-mono text-xs text-muted hover:text-fg"
+            onClick={onRelease}
+            aria-label="Release (Esc)"
+          >
+            <X className="size-3.5" />
+            Release
+          </button>
+        </div>
       </div>
+      {photo ? (
+        <img
+          src={photo}
+          alt={`${signal.name}, ${signal.common}`}
+          className="dossier-photo"
+          loading="lazy"
+          referrerPolicy="no-referrer"
+          onError={() => setPhotoOk(false)}
+        />
+      ) : null}
       <div className="space-y-3 px-4 py-3">
         <div>
           <p className="font-mono text-xs uppercase tracking-widest text-muted">
@@ -876,6 +1035,9 @@ function Dossier({
           <Fact label="Longitude" value={signal.lng.toFixed(3)} />
           {signal.sex ? <Fact label="Sex" value={signal.sex} /> : null}
           {signal.length ? <Fact label="Length" value={signal.length} /> : null}
+          {signal.weight ? <Fact label="Weight" value={signal.weight} /> : null}
+          {signal.stage ? <Fact label="Life stage" value={signal.stage} /> : null}
+          {signal.credit ? <Fact label="Observed by" value={signal.credit} /> : null}
           {signal.place ? (
             <Fact
               label={

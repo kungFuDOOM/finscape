@@ -22,10 +22,13 @@ type Dot = {
   moving: boolean;
   kind: Signal["kind"];
   name: string;
+  common: string;
   heading: number | null;
   fresh: boolean;
   /** Hydrophone platforms: whether analysts heard whales in the last few reviews. */
   hearing: boolean;
+  hot: boolean;
+  phase: number;
 };
 type Hit = { id: string; x: number; y: number };
 type View = { zoom: number; lng: number; lat: number };
@@ -206,6 +209,39 @@ function project(
   return { x: cx + nx * radius, y: cy - ny * radius };
 }
 
+/** Unit vector toward the sun in the globe's frame, from a low-precision solar position. */
+function sunVector(at: number): [number, number, number] {
+  const date = new Date(at);
+  const start = Date.UTC(date.getUTCFullYear(), 0, 0);
+  const day = (at - start) / 86_400_000;
+  const decl = -23.44 * Math.cos(((2 * Math.PI) / 365) * (day + 10)) * D2R;
+  const hours = date.getUTCHours() + date.getUTCMinutes() / 60 + date.getUTCSeconds() / 3600;
+  const lng = wrapLng(-(hours - 12) * 15) * D2R;
+  return [Math.cos(decl) * Math.cos(lng), Math.cos(decl) * Math.sin(lng), Math.sin(decl)];
+}
+
+function makeStars(count: number): { x: number; y: number; r: number; a: number }[] {
+  let seed = 7;
+  const rand = () => {
+    seed = (seed * 16807) % 2147483647;
+    return seed / 2147483647;
+  };
+  return Array.from({ length: count }, () => ({
+    x: rand(),
+    y: rand(),
+    r: rand() < 0.08 ? 1.3 : 0.7,
+    a: 0.18 + rand() * 0.5,
+  }));
+}
+
+const STARS = makeStars(240);
+
+function phaseFor(id: string): number {
+  let hash = 0;
+  for (let i = 0; i < id.length; i += 1) hash = (hash * 31 + id.charCodeAt(i)) | 0;
+  return ((hash >>> 0) % 1000) / 1000;
+}
+
 function tileX(lng: number, z: number): number {
   return ((lng + 180) / 360) * 2 ** z;
 }
@@ -264,7 +300,10 @@ function GlobeViewInner({ signals, routes, selectedId, onSelect, jump }: Props) 
     const pointers = new Map<number, { x: number; y: number }>();
     let frame = 0;
     let dragged = 0;
-    let spin = false;
+    let spin = !reduced;
+    let hoverId: string | null = null;
+    let sun = sunVector(Date.now());
+    let sunAt = Date.now();
     let velLat = 0;
     let velLng = 0;
     let filtDx = 0;
@@ -308,7 +347,11 @@ function GlobeViewInner({ signals, routes, selectedId, onSelect, jump }: Props) 
         const ictx = scratch.getContext("2d", { willReadFrequently: true });
         if (!ictx) return;
         ictx.drawImage(img, 0, 0);
-        created.pixels = ictx.getImageData(0, 0, scratch.width, scratch.height).data;
+        try {
+          created.pixels = ictx.getImageData(0, 0, scratch.width, scratch.height).data;
+        } catch {
+          return; // a tile served without CORS stays unreadable; the base texture covers it
+        }
         created.w = scratch.width;
         created.h = scratch.height;
         created.ready = true;
@@ -326,7 +369,8 @@ function GlobeViewInner({ signals, routes, selectedId, onSelect, jump }: Props) 
     };
 
     const sample = (lat: number, lng: number, z: number): [number, number, number] => {
-      for (let level = z; level >= 3; level -= 1) {
+      // Web Mercator tiles stop at ±85°; the poles come from the base texture.
+      for (let level = Math.abs(lat) < 84.5 ? z : 0; level >= 3; level -= 1) {
         const tx = tileX(lng, level);
         const ty = tileY(lat, level);
         const ix = Math.floor(tx);
@@ -478,13 +522,23 @@ function GlobeViewInner({ signals, routes, selectedId, onSelect, jump }: Props) 
         Math.abs(deltaLng(view.lng, aim.lng)) > 0.02 ||
         Math.abs(aim.zoom - view.zoom) > 0.012;
 
+      if (Date.now() - sunAt > 60_000) {
+        sunAt = Date.now();
+        sun = sunVector(sunAt);
+        dirty = true;
+      }
       const radius = radiusFor(view.zoom, w, h);
       const b = basis(view.lat, view.lng);
-      const movingCamera = interacting || gliding || Math.abs(velLat) > 0.004 || Math.abs(velLng) > 0.004 || spin;
+      const movingCamera = interacting || gliding || Math.abs(velLat) > 0.004 || Math.abs(velLng) > 0.004;
       const settling = performance.now() - tileClock < 220;
-      const stride = movingCamera || settling ? (w * h > 900000 ? 3 : 2) : 1;
-      const bw = Math.max(2, Math.ceil(w / stride));
-      const bh = Math.max(2, Math.ceil(h / stride));
+      // The idle spin is slow and the whole globe fits on screen, so it can afford full resolution.
+      const idleSpin = spin && !movingCamera && radius * radius * Math.PI < 700_000;
+      const stride = (movingCamera || spin || settling) && !idleSpin ? (w * h > 900000 ? 3 : 2) : 1;
+      // Once the camera rests, render the terrain at device resolution so retina screens stay crisp.
+      const scale = !movingCamera && !spin && !settling ? dpr : 1;
+      const px = stride / scale;
+      const bw = Math.max(2, Math.ceil(w / px));
+      const bh = Math.max(2, Math.ceil(h / px));
       if (!terrain || terrain.width !== bw || terrain.height !== bh) {
         terrain = document.createElement("canvas");
         terrain.width = bw;
@@ -503,10 +557,24 @@ function GlobeViewInner({ signals, routes, selectedId, onSelect, jump }: Props) 
         const pix = buf.data;
         const cx = w / 2;
         const cy = h / 2;
+        // Night shading fades out as you zoom in, so close-up imagery stays readable.
+        const night = clamp((3 - view.zoom) / 2, 0, 1) * 0.55;
+        const [sx0, sy0, sz0] = sun;
+        // Sun glint: the half-vector between the sun and the viewer.
+        let hx = sx0 + b.fx;
+        let hy = sy0 + b.fy;
+        let hz = sz0 + b.fz;
+        const hl = Math.hypot(hx, hy, hz) || 1;
+        hx /= hl;
+        hy /= hl;
+        hz /= hl;
+        const glint = night > 0 ? night / 0.55 : 0;
         const detail =
           radius > Math.min(w, h) * 0.72
             ? clamp(Math.round(Math.log2(((radius * Math.PI) / 180) * (360 / 256))), 3, 10)
-            : 0;
+            : scale > 1 && radius * dpr >= 420
+              ? 3
+              : 0;
         if (detail >= 3) {
           const tilePx = ((360 / 2 ** detail) * radius * Math.PI) / 180;
           const step = Math.max(36, Math.min(tilePx * 0.75, 240));
@@ -534,10 +602,10 @@ function GlobeViewInner({ signals, routes, selectedId, onSelect, jump }: Props) 
           }
         }
         for (let y = 0; y < bh; y += 1) {
-          const ny = (cy - (y + 0.5) * stride) / radius;
+          const ny = (cy - (y + 0.5) * px) / radius;
           const row = y * bw;
           for (let x = 0; x < bw; x += 1) {
-            const nx = ((x + 0.5) * stride - cx) / radius;
+            const nx = ((x + 0.5) * px - cx) / radius;
             const i = (row + x) * 4;
             const r2 = nx * nx + ny * ny;
             if (r2 > 1) {
@@ -552,9 +620,24 @@ function GlobeViewInner({ signals, routes, selectedId, onSelect, jump }: Props) 
             const lng = Math.atan2(wy, wx) * R2D;
             const color = sample(lat, lng, detail);
             const light = 0.78 + 0.22 * nz;
-            pix[i] = color[0] * light;
-            pix[i + 1] = color[1] * light;
-            pix[i + 2] = color[2] * light;
+            let dark = 0;
+            if (night > 0) {
+              const t = clamp((wx * sx0 + wy * sy0 + wz * sz0 + 0.1) / 0.2, 0, 1);
+              dark = night * (1 - t * t * (3 - 2 * t));
+            }
+            let shine = 0;
+            if (glint > 0 && color[2] > color[0] + 8 && color[2] >= color[1]) {
+              const d = wx * hx + wy * hy + wz * hz;
+              if (d > 0.97) {
+                const d4 = d * d * d * d;
+                const d16 = d4 * d4 * d4 * d4;
+                const d64 = d16 * d16 * d16 * d16;
+                shine = d64 * d64 * glint * 85;
+              }
+            }
+            pix[i] = color[0] * light * (1 - dark) + shine;
+            pix[i + 1] = color[1] * light * (1 - dark * 0.9) + shine;
+            pix[i + 2] = color[2] * light * (1 - dark * 0.72) + shine * 0.9;
             pix[i + 3] = 255;
           }
         }
@@ -564,13 +647,25 @@ function GlobeViewInner({ signals, routes, selectedId, onSelect, jump }: Props) 
 
       ctx.fillStyle = "#071016";
       ctx.fillRect(0, 0, w, h);
+      if (radius < Math.hypot(w, h) * 0.5) {
+        const drift = view.lng / 360;
+        ctx.fillStyle = "#cfe9e3";
+        for (const star of STARS) {
+          const x = (((star.x - drift * 0.18) % 1) + 1) % 1;
+          ctx.globalAlpha = star.a;
+          ctx.fillRect(x * w, star.y * h, star.r, star.r);
+        }
+        ctx.globalAlpha = 1;
+      }
       if (radius < Math.min(w, h) * 0.72) {
-        const glow = ctx.createRadialGradient(w / 2, h / 2, radius * 0.92, w / 2, h / 2, radius * 1.14);
-        glow.addColorStop(0, "rgba(62,224,197,0)");
-        glow.addColorStop(1, "rgba(62,224,197,0.22)");
+        const glow = ctx.createRadialGradient(w / 2, h / 2, radius * 0.96, w / 2, h / 2, radius * 1.22);
+        glow.addColorStop(0, "rgba(62,224,197,0.34)");
+        glow.addColorStop(0.18, "rgba(62,224,197,0.16)");
+        glow.addColorStop(0.5, "rgba(62,224,197,0.05)");
+        glow.addColorStop(1, "rgba(62,224,197,0)");
         ctx.fillStyle = glow;
         ctx.beginPath();
-        ctx.arc(w / 2, h / 2, radius * 1.14, 0, Math.PI * 2);
+        ctx.arc(w / 2, h / 2, radius * 1.22, 0, Math.PI * 2);
         ctx.fill();
       }
       if (terrain) {
@@ -580,8 +675,33 @@ function GlobeViewInner({ signals, routes, selectedId, onSelect, jump }: Props) 
       if (radius < Math.hypot(w, h) * 0.55) {
         ctx.beginPath();
         ctx.arc(w / 2, h / 2, radius, 0, Math.PI * 2);
-        ctx.strokeStyle = "rgba(62,224,197,0.7)";
-        ctx.lineWidth = 1.5;
+        ctx.strokeStyle = "rgba(62,224,197,0.45)";
+        ctx.lineWidth = 1;
+        ctx.stroke();
+      }
+
+      const put = (lat: number, lng: number) => project(lat, lng, b, w / 2, h / 2, radius);
+      const gridAlpha = 0.09 * clamp(2.4 - view.zoom, 0, 1);
+      if (gridAlpha > 0.005) {
+        ctx.strokeStyle = `rgba(62,224,197,${gridAlpha.toFixed(3)})`;
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        const trace = (fn: (t: number) => { lat: number; lng: number }, steps: number) => {
+          let started = false;
+          for (let k = 0; k <= steps; k += 1) {
+            const at = fn(k / steps);
+            const p = put(at.lat, at.lng);
+            if (!p) {
+              started = false;
+              continue;
+            }
+            if (started) ctx.lineTo(p.x, p.y);
+            else ctx.moveTo(p.x, p.y);
+            started = true;
+          }
+        };
+        for (let lng = -180; lng < 180; lng += 30) trace((t) => ({ lat: -80 + t * 160, lng }), 48);
+        for (let lat = -60; lat <= 60; lat += 30) trace((t) => ({ lat, lng: -180 + t * 360 }), 120);
         ctx.stroke();
       }
 
@@ -615,16 +735,46 @@ function GlobeViewInner({ signals, routes, selectedId, onSelect, jump }: Props) 
           moving: Boolean(live),
           kind: signal.kind,
           name: signal.name,
+          common: signal.common,
           heading: legs.get(signal.id)?.heading ?? null,
           fresh: Date.now() - Date.parse(signal.observedAt) < 120 * 86_400_000,
           hearing: Boolean(signal.heard?.recent.length),
+          hot: signal.kind === "tag" && wall - Date.parse(signal.observedAt) < 48 * 3_600_000,
+          phase: phaseFor(signal.id),
         };
       });
       const layer = { sighting: 0, heard: 1, tag: 2 } as const;
       dots.sort((a, b) => layer[a.kind] - layer[b.kind]);
       const focus = routesRef.current.find((route) => route.id === selectedRef.current)?.points ?? null;
       const hits: Hit[] = [];
-      const put = (lat: number, lng: number) => project(lat, lng, b, w / 2, h / 2, radius);
+
+      // Fading wakes behind every recently moving tag: the last few weeks of pings.
+      ctx.lineWidth = 1.4;
+      ctx.lineCap = "round";
+      for (const route of routesRef.current) {
+        if (route.id === selectedRef.current || route.points.length < 2) continue;
+        const last = route.points[route.points.length - 1];
+        const lastAt = Date.parse(last.at);
+        if (!Number.isFinite(lastAt) || wall - lastAt > 120 * 86_400_000) continue;
+        const tail = route.points.filter((point) => lastAt - Date.parse(point.at) <= 30 * 86_400_000).slice(-16);
+        const head = shown.get(route.id);
+        const path = head ? [...tail, { ...head, at: last.at }] : tail;
+        if (path.length < 2) continue;
+        ctx.strokeStyle = COLORS[route.group];
+        let prev = put(path[0].lat, path[0].lng);
+        for (let k = 1; k < path.length; k += 1) {
+          const next = put(path[k].lat, path[k].lng);
+          if (prev && next) {
+            ctx.globalAlpha = 0.08 + 0.5 * (k / (path.length - 1));
+            ctx.beginPath();
+            ctx.moveTo(prev.x, prev.y);
+            ctx.lineTo(next.x, next.y);
+            ctx.stroke();
+          }
+          prev = next;
+        }
+      }
+      ctx.globalAlpha = 1;
 
       if (focus && focus.length > 1) {
         ctx.beginPath();
@@ -693,6 +843,16 @@ function GlobeViewInner({ signals, routes, selectedId, onSelect, jump }: Props) 
           ctx.arc(p.x, p.y, size * 2.2, 0, Math.PI * 2);
           ctx.fill();
         }
+        if (dot.hot && !reduced) {
+          // A sonar ping for tags that surfaced in the last 48 hours.
+          const t = (now / 2400 + dot.phase) % 1;
+          ctx.beginPath();
+          ctx.strokeStyle = COLORS[dot.group];
+          ctx.lineWidth = 1.5;
+          ctx.globalAlpha = 0.7 * (1 - t);
+          ctx.arc(p.x, p.y, size * (1.4 + 3.2 * t), 0, Math.PI * 2);
+          ctx.stroke();
+        }
         ctx.globalAlpha = quiet ? 0.45 : sighting ? 0.62 : 1;
         ctx.beginPath();
         ctx.fillStyle = COLORS[dot.group];
@@ -744,6 +904,43 @@ function GlobeViewInner({ signals, routes, selectedId, onSelect, jump }: Props) 
         ctx.fillText(text, left, p.y);
         labeled.push(p);
       }
+      const hovered = hoverId ? dots.find((dot) => dot.id === hoverId) : null;
+      if (hovered && hovered.id !== selectedRef.current) {
+        const p = put(hovered.lat, hovered.lng);
+        if (p) {
+          const title = hovered.name.length > 28 ? `${hovered.name.slice(0, 27)}…` : hovered.name;
+          const sub = `${hovered.kind === "tag" ? "Tag" : hovered.kind === "heard" ? "Hydrophone" : "Sighting"} · ${hovered.common}`;
+          const line2 = sub.length > 34 ? `${sub.slice(0, 33)}…` : sub;
+          ctx.font = "600 13px IBM Plex Mono, ui-monospace, monospace";
+          const tw1 = ctx.measureText(title).width;
+          ctx.font = "400 11px IBM Plex Mono, ui-monospace, monospace";
+          const tw2 = ctx.measureText(line2).width;
+          const bw2 = Math.max(tw1, tw2) + 20;
+          const bh2 = 44;
+          let left = p.x + 14;
+          let top = p.y - bh2 - 10;
+          if (left + bw2 > w - 8) left = p.x - bw2 - 14;
+          if (top < 8) top = p.y + 12;
+          ctx.fillStyle = "rgba(13,26,34,0.94)";
+          ctx.strokeStyle = COLORS[hovered.group];
+          ctx.lineWidth = 1;
+          ctx.beginPath();
+          ctx.roundRect(left, top, bw2, bh2, 8);
+          ctx.fill();
+          ctx.stroke();
+          ctx.textBaseline = "alphabetic";
+          ctx.fillStyle = "#e7f4f1";
+          ctx.font = "600 13px IBM Plex Mono, ui-monospace, monospace";
+          ctx.fillText(title, left + 10, top + 18);
+          ctx.fillStyle = "#8aa39c";
+          ctx.font = "400 11px IBM Plex Mono, ui-monospace, monospace";
+          ctx.fillText(line2, left + 10, top + 35);
+          ctx.beginPath();
+          ctx.strokeStyle = "#f4fff8";
+          ctx.arc(p.x, p.y, 9, 0, Math.PI * 2);
+          ctx.stroke();
+        }
+      }
       hitsRef.current = hits;
       frame = requestAnimationFrame(paint);
     };
@@ -782,9 +979,36 @@ function GlobeViewInner({ signals, routes, selectedId, onSelect, jump }: Props) 
         /* pointer already gone */
       }
     };
+    const nearest = (clientX: number, clientY: number, reach: number): Hit | null => {
+      const rect = canvas.getBoundingClientRect();
+      const x = clientX - rect.left;
+      const y = clientY - rect.top;
+      let best: Hit | null = null;
+      let bestD = reach;
+      for (const hit of hitsRef.current) {
+        const d = Math.hypot(hit.x - x, hit.y - y);
+        if (d < bestD) {
+          best = hit;
+          bestD = d;
+        }
+      }
+      return best;
+    };
     const move = (event: PointerEvent) => {
       const prev = pointers.get(event.pointerId);
-      if (!prev) return;
+      if (!prev) {
+        if (event.pointerType !== "mouse") return;
+        const next = nearest(event.clientX, event.clientY, 16)?.id ?? null;
+        if (next !== hoverId) {
+          hoverId = next;
+          canvas.style.cursor = next ? "pointer" : "";
+        }
+        return;
+      }
+      if (hoverId) {
+        hoverId = null;
+        canvas.style.cursor = "";
+      }
       pointers.set(event.pointerId, { x: event.clientX, y: event.clientY });
       if (event.cancelable) event.preventDefault();
       const pair = pinchPair();
@@ -834,19 +1058,12 @@ function GlobeViewInner({ signals, routes, selectedId, onSelect, jump }: Props) 
     };
     const click = (event: MouseEvent) => {
       if (dragged > 8) return;
-      const rect = canvas.getBoundingClientRect();
-      const x = event.clientX - rect.left;
-      const y = event.clientY - rect.top;
-      let best: Hit | null = null;
-      let bestD = 28;
-      for (const hit of hitsRef.current) {
-        const d = Math.hypot(hit.x - x, hit.y - y);
-        if (d < bestD) {
-          best = hit;
-          bestD = d;
-        }
-      }
+      const best = nearest(event.clientX, event.clientY, 28);
       if (best) onSelectRef.current(best.id);
+    };
+    const leave = () => {
+      hoverId = null;
+      canvas.style.cursor = "";
     };
     const wheel = (event: WheelEvent) => {
       if (event.target instanceof Element && event.target.closest("button")) return;
@@ -867,6 +1084,7 @@ function GlobeViewInner({ signals, routes, selectedId, onSelect, jump }: Props) 
     canvas.addEventListener("pointerup", up);
     canvas.addEventListener("pointercancel", up);
     canvas.addEventListener("click", click);
+    canvas.addEventListener("pointerleave", leave);
     wrap.addEventListener("wheel", wheel, { passive: false });
 
     return () => {
@@ -877,6 +1095,7 @@ function GlobeViewInner({ signals, routes, selectedId, onSelect, jump }: Props) 
       canvas.removeEventListener("pointerup", up);
       canvas.removeEventListener("pointercancel", up);
       canvas.removeEventListener("click", click);
+      canvas.removeEventListener("pointerleave", leave);
       wrap.removeEventListener("wheel", wheel);
     };
   }, []);

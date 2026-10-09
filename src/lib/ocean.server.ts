@@ -16,6 +16,10 @@ import { loadSharkSmart } from "./sharksmart.server";
 import { loadWhaleTags } from "./wildlife.server";
 
 const TTL_MS = 75_000;
+// A forced refresh still waits this long, so many open tabs share one upstream pull.
+const FRESH_FLOOR_MS = 30_000;
+// Research-grade sightings change slowly and cost ~24 iNaturalist calls per pull.
+const SIGHTING_TTL_MS = 15 * 60_000;
 const INAT_PAGE = 60;
 
 const THEATERS: Array<[string, number, number, number, number]> = [
@@ -116,7 +120,8 @@ function parseMotion(value: unknown): TrackPoint[] {
 }
 
 export function loadSignals(fresh = false): Promise<Feed> {
-  if (!fresh && cache && Date.now() - cache.at < TTL_MS) return Promise.resolve(cache.data);
+  const age = cache ? Date.now() - cache.at : Infinity;
+  if (cache && age < (fresh ? FRESH_FLOOR_MS : TTL_MS)) return Promise.resolve(cache.data);
   if (inflight) return inflight;
   inflight = buildFeed()
     .then((data) => {
@@ -201,7 +206,7 @@ async function buildFeed(): Promise<Feed> {
     settle("ghri", "Guy Harvey Research Institute shark tags", loadGhri()),
     settle("sharksmart", "SharkSmart WA detections & sightings", loadSharkSmart()),
     settle("acartia", "Acartia live sightings (Pacific Northwest)", loadAcartia()),
-    fetchInat(since),
+    loadSightings(since),
     settle("whoi", "WHOI Robots4Whales listening platforms", loadWhoi()),
   ]);
   const parts = [tags, whales, makos, wa, heard, live, sightings];
@@ -335,6 +340,21 @@ type InatResult = {
   status: SourceStatus;
 };
 
+let sightingCache: { at: number; data: InatResult } | null = null;
+
+async function loadSightings(since: string): Promise<InatResult> {
+  if (sightingCache && Date.now() - sightingCache.at < SIGHTING_TTL_MS) return sightingCache.data;
+  const next = await fetchInat(since);
+  if (next.status.ok) {
+    sightingCache = { at: Date.now(), data: next };
+    return next;
+  }
+  // Keep the last good batch when iNaturalist stumbles, and retry in ~2 minutes, not every pull.
+  const retryAt = Date.now() - SIGHTING_TTL_MS + 2 * 60_000;
+  sightingCache = { at: retryAt, data: sightingCache?.data ?? next };
+  return sightingCache.data;
+}
+
 async function fetchInat(since: string): Promise<InatResult> {
   const status: SourceStatus = {
     id: "inaturalist",
@@ -401,7 +421,7 @@ async function fetchInatBox(
     nelat: String(box[3]),
     nelng: String(box[4]),
     fields:
-      "id,species_guess,location,observed_on,time_observed_at,place_guess,uri,obscured,geoprivacy,taxon.name,taxon.preferred_common_name",
+      "id,species_guess,location,observed_on,time_observed_at,place_guess,uri,obscured,geoprivacy,taxon.name,taxon.preferred_common_name,photos.url,user.login",
   });
   const data = await fetchJson(`https://api.inaturalist.org/v2/observations?${params}`, 20_000);
   const root = asRecord(data);
@@ -435,6 +455,9 @@ function inatObservation(group: Group, value: unknown): Signal | null {
     str(row.time_observed_at) ??
     (str(row.observed_on) ? `${str(row.observed_on)}T00:00:00Z` : null);
   if (!observedAt) return null;
+  const photos = Array.isArray(row.photos) ? row.photos : [];
+  const thumb = str(asRecord(photos[0])?.url);
+  const login = str(asRecord(row.user)?.login);
   return {
     id: `inat:${id}`,
     name: common,
@@ -451,9 +474,11 @@ function inatObservation(group: Group, value: unknown): Signal | null {
     length: null,
     weight: null,
     stage: null,
-    image: null,
+    // iNaturalist hands back the square thumbnail; the medium size suits the dossier.
+    image: thumb ? thumb.replace("/square.", "/medium.") : null,
     url: str(row.uri) ?? `https://www.inaturalist.org/observations/${id}`,
     tagId: null,
+    credit: login ? `@${login} on iNaturalist` : null,
   };
 }
 
