@@ -116,7 +116,9 @@ type Heard = { species: string; day: number; table: string; level: "Detected" | 
 
 /** Reads a platform page: its title, newest review date, and species heard per recent day. */
 export function parsePlatform(html: string): { title: string; latest: number; heard: Heard[] } | null {
-  const title = html.match(/<title>([^<]+)<\/title>/i)?.[1]?.trim() ?? "WHOI platform";
+  const raw = html.match(/<title>([^<]+)<\/title>/i)?.[1]?.trim() ?? "WHOI platform";
+  // Glider titles end with their deployment date ("…, Canada, September 2026"); drop it.
+  const title = raw.replace(/,?\s*(?:[A-Z][a-z]+)\s+\d{4}$/, "").trim() || raw;
   const start = html.indexOf("Daily analyst review");
   if (start < 0) return null;
   const table = html.slice(start, html.indexOf("</table>", start));
