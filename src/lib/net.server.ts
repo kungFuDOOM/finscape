@@ -1,4 +1,4 @@
-import type { TrackPoint } from "./ocean.types";
+export { downsample } from "./motion";
 
 const UA = "FinScape/1.0 (educational live ocean map)";
 
@@ -48,18 +48,6 @@ export function num(value: unknown): number | null {
 /** Sorts newest first by parsed time; ISO strings with mixed offsets do not sort as text. */
 export function byNewest<T extends { observedAt: string }>(a: T, b: T): number {
   return (Date.parse(b.observedAt) || 0) - (Date.parse(a.observedAt) || 0);
-}
-
-export function downsample(points: TrackPoint[], max: number): TrackPoint[] {
-  if (points.length <= max) return points;
-  const tailCount = Math.min(12, Math.floor(max / 3));
-  const tail = points.slice(-tailCount);
-  const head = points.slice(0, -tailCount);
-  const budget = Math.max(1, max - tail.length);
-  if (head.length <= budget) return [...head, ...tail];
-  const step = Math.ceil(head.length / budget);
-  const kept = head.filter((_, index) => index % step === 0);
-  return [...kept, ...tail];
 }
 
 export async function pool<T, R>(

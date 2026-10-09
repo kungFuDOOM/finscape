@@ -1,6 +1,6 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ChevronDown, RefreshCw, Search } from "lucide-react";
-import { getLiveRoutes, getSignals, getTrack } from "@/lib/ocean.functions";
+import { loadFeed, loadRoutes, loadTrack } from "@/lib/feed-client";
 import type {
   CallStatus,
   Feed,
@@ -176,7 +176,7 @@ export function PelagosApp() {
 
   const load = useCallback(async (fresh: boolean) => {
     try {
-      const next = await getSignals({ data: { fresh } });
+      const next = await loadFeed(fresh);
       setFeed(next);
       setError(null);
     } catch (err) {
@@ -191,7 +191,7 @@ export function PelagosApp() {
     const pull = (fresh: boolean) => {
       if (fresh && document.hidden) return;
       void load(fresh);
-      void getLiveRoutes({ data: { fresh } })
+      void loadRoutes(fresh)
         .then((next) => {
           if (!cancel) setRoutes(next);
         })
@@ -284,7 +284,7 @@ export function PelagosApp() {
     }
     let cancel = false;
     const pull = () => {
-      void getTrack({ data: { id: selected.tagId! } })
+      void loadTrack(selected.tagId!)
         .then((next) => {
           if (cancel) return;
           setTrack(next);

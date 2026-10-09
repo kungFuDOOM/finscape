@@ -21,3 +21,18 @@ npm run dev
 ```
 
 The map opens at [http://localhost:8080](http://localhost:8080).
+
+## GitHub Pages
+
+The live site is <https://kungfudoom.github.io/finscape/>. Pages only serves static files, so
+`.github/workflows/pages.yml` collects every source into `data/feed.json` and
+`data/routes.json` and redeploys on each push to `main` and every 30 minutes. Satellite tiles
+and full OCEARCH tracks load straight from the browser.
+
+One-time setup: Settings → Pages → Build and deployment → Source: **GitHub Actions**.
+
+Build the static site locally:
+
+```bash
+PAGES_BASE=/finscape/ npm run pages:build   # writes dist-pages/
+```

@@ -31,6 +31,9 @@
   },
   "include": [
     "src",
-    "server"
+    "server",
+    "pages",
+    "scripts/pages-data.ts",
+    "vite.pages.config.ts"
   ]
 }

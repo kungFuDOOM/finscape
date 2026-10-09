@@ -1,6 +1,7 @@
 import { loadAcartia } from "./acartia.server";
 import { loadGhri } from "./ghri.server";
-import { asRecord, byNewest, downsample, fetchJson, num, pool, str } from "./net.server";
+import { downsample, MAPOTIC, motionPoints, readTrack, trackUrl } from "./motion";
+import { asRecord, byNewest, fetchJson, num, pool, str } from "./net.server";
 import type {
   Feed,
   Group,
@@ -14,8 +15,6 @@ import { loadWhoi } from "./whoi.server";
 import { loadSharkSmart } from "./sharksmart.server";
 import { loadWhaleTags } from "./wildlife.server";
 
-const MAP_ID = 3413;
-const MAPOTIC = `https://www.mapotic.com/api/v1/maps/${MAP_ID}`;
 const TTL_MS = 75_000;
 const INAT_PAGE = 60;
 
@@ -113,21 +112,7 @@ async function fetchMotionRoutes(tags: Signal[]): Promise<LiveRoute[]> {
 }
 
 function parseMotion(value: unknown): TrackPoint[] {
-  if (!Array.isArray(value)) return [];
-  const points: TrackPoint[] = [];
-  for (const row of value) {
-    const item = asRecord(row);
-    const point = asRecord(item?.point);
-    const coords = Array.isArray(point?.coordinates) ? point.coordinates : [];
-    const lng = num(coords[0]);
-    const lat = num(coords[1]);
-    const at = str(item?.dt_move);
-    if (lng === null || lat === null || !at) continue;
-    if (Math.abs(lat) > 90 || Math.abs(lng) > 180) continue;
-    points.push({ lat, lng, at });
-  }
-  points.sort((a, b) => (a.at < b.at ? -1 : 1));
-  return downsample(points, 56);
+  return downsample(motionPoints(value), 56);
 }
 
 export function loadSignals(fresh = false): Promise<Feed> {
@@ -473,23 +458,7 @@ function inatObservation(group: Group, value: unknown): Signal | null {
 
 async function fetchTrack(tagId: number): Promise<Track> {
   try {
-    const data = await fetchJson(`${MAPOTIC}/pois/${tagId}/motion/with-meta/`, 20_000);
-    const root = asRecord(data);
-    const motion = Array.isArray(root?.motion) ? root.motion : [];
-    const points: TrackPoint[] = [];
-    for (const row of motion) {
-      const item = asRecord(row);
-      const point = asRecord(item?.point);
-      const coords = Array.isArray(point?.coordinates) ? point.coordinates : [];
-      const lng = num(coords[0]);
-      const lat = num(coords[1]);
-      const at = str(item?.dt_move);
-      if (lng === null || lat === null || !at) continue;
-      if (Math.abs(lat) > 90 || Math.abs(lng) > 180) continue;
-      points.push({ lat, lng, at });
-    }
-    points.sort((a, b) => (a.at < b.at ? -1 : 1));
-    return { tagId, points: downsample(points, 420), error: null };
+    return readTrack(tagId, await fetchJson(trackUrl(tagId), 20_000));
   } catch (error) {
     return {
       tagId,

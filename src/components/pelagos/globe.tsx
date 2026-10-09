@@ -1,5 +1,6 @@
 import { memo, useEffect, useRef } from "react";
 import { Minus, Plus } from "lucide-react";
+import { tileUrl } from "@/lib/feed-client";
 import type { Group, LiveRoute, Signal, TrackPoint } from "@/lib/ocean.types";
 
 const COLORS: Record<Group, string> = {
@@ -239,7 +240,7 @@ function GlobeViewInner({ signals, routes, selectedId, onSelect, jump }: Props) 
     if (!ctx) return;
 
     const earth = new Image();
-    earth.src = "/earth.jpg";
+    earth.src = `${import.meta.env.BASE_URL}earth.jpg`;
     let earthPx: Uint8ClampedArray | null = null;
     let earthW = 0;
     let earthH = 0;
@@ -314,7 +315,9 @@ function GlobeViewInner({ signals, routes, selectedId, onSelect, jump }: Props) 
         tileClock = performance.now();
         dirty = true;
       };
-      img.src = `/api/sat/${z}/${y}/${wrapped}`;
+      // Tiles are read back as pixels, so they must load as CORS images.
+      img.crossOrigin = "anonymous";
+      img.src = tileUrl(z, y, wrapped);
       tiles.set(key, created);
       if (tiles.size > 180) {
         const oldest = tiles.keys().next().value;
