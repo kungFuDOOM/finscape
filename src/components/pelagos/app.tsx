@@ -1,7 +1,19 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ChevronDown, RefreshCw, Search } from "lucide-react";
 import { getLiveRoutes, getSignals, getTrack } from "@/lib/ocean.functions";
-import type { Feed, Group, Kind, LiveRoute, Signal, Track, TrackPoint } from "@/lib/ocean.types";
+import type {
+  CallStatus,
+  Feed,
+  Group,
+  Heard,
+  Kind,
+  LiveRoute,
+  Signal,
+  SourceId,
+  SourceStatus,
+  Track,
+  TrackPoint,
+} from "@/lib/ocean.types";
 import { GlobeView, trackLeg } from "./globe";
 
 type WindowKey = "48h" | "30d" | "90d" | "all";
@@ -13,11 +25,30 @@ const WINDOWS: { id: WindowKey; label: string; ms: number | null }[] = [
   { id: "all", label: "All", ms: null },
 ];
 
-const GROUPS: { id: Group; label: string }[] = [
-  { id: "whale", label: "Whales" },
-  { id: "shark", label: "Sharks" },
-  { id: "dolphin", label: "Dolphins" },
+const GROUPS: { id: Group; label: string; count: string }[] = [
+  { id: "whale", label: "Whales", count: "whales" },
+  { id: "shark", label: "Sharks", count: "sharks" },
+  { id: "dolphin", label: "Dolphins", count: "dolphins" },
+  { id: "other", label: "Turtles & seals", count: "turtles · seals" },
 ];
+
+const LAYERS: { id: Kind; label: string; tag: string }[] = [
+  { id: "tag", label: "Tags", tag: "TAG" },
+  { id: "heard", label: "Heard", tag: "HEARD" },
+  { id: "sighting", label: "Seen", tag: "SEEN" },
+];
+
+/** Hydrophones first: there are only a handful, and hundreds of quiet tags would bury them. */
+const KIND_ORDER: Record<Kind, number> = { heard: 0, tag: 1, sighting: 2 };
+
+const SOURCE_LINK: Record<SourceId, string> = {
+  ocearch: "Open on OCEARCH",
+  movebank: "Open the study on Movebank",
+  whoi: "Open the WHOI platform page",
+  inaturalist: "Open on iNaturalist",
+};
+
+const DAY_MS = 86_400_000;
 
 const OCEANS = [
   { id: "california", label: "California", lat: 34.5, lng: -121, zoom: 2.3 },
@@ -52,12 +83,40 @@ function ageLabel(iso: string, now: number): string {
   if (hours < 48) return `${hours}h ago`;
   const days = Math.floor(hours / 24);
   if (days < 60) return `${days}d ago`;
-  return `${Math.floor(days / 30)}mo ago`;
+  if (days < 730) return `${Math.floor(days / 30)}mo ago`;
+  return `${Math.floor(days / 365)}y ago`;
+}
+
+/** WHOI publishes one review per calendar day, so its signals read in days, not hours. */
+function dayLabel(iso: string, now: number): string {
+  const day = Date.UTC(
+    new Date(iso).getUTCFullYear(),
+    new Date(iso).getUTCMonth(),
+    new Date(iso).getUTCDate(),
+  );
+  const today = Date.UTC(new Date(now).getUTCFullYear(), new Date(now).getUTCMonth(), new Date(now).getUTCDate());
+  const days = Math.round((today - day) / DAY_MS);
+  if (days <= 0) return "today";
+  if (days === 1) return "yesterday";
+  return `${days}d ago`;
+}
+
+function whenLabel(signal: Signal, now: number | null): string {
+  if (now === null) return formatUtc(signal.observedAt);
+  return signal.kind === "heard" ? dayLabel(signal.observedAt, now) : ageLabel(signal.observedAt, now);
+}
+
+/** Tags that pinged in the last 3 days and platforms that heard a whale in the last 3 reviews. */
+function isLive(signal: Signal, now: number): boolean {
+  if (signal.kind === "heard") return Boolean(signal.heard?.recent.length);
+  if (signal.kind !== "tag" || signal.archive) return false;
+  return now - Date.parse(signal.observedAt) < 3 * DAY_MS;
 }
 
 function pipClass(group: Group): string {
   if (group === "whale") return "bg-whale text-whale";
   if (group === "dolphin") return "bg-dolphin text-dolphin";
+  if (group === "other") return "bg-other text-other";
   return "bg-shark text-shark";
 }
 
@@ -81,9 +140,14 @@ export function PelagosApp() {
   const [feed, setFeed] = useState<Feed | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
-  const [groups, setGroups] = useState<Record<Group, boolean>>({ whale: true, shark: true, dolphin: true });
+  const [groups, setGroups] = useState<Record<Group, boolean>>({
+    whale: true,
+    shark: true,
+    dolphin: true,
+    other: true,
+  });
   const [windowKey, setWindowKey] = useState<WindowKey>("all");
-  const [kind, setKind] = useState<Kind | "all">("tag");
+  const [layers, setLayers] = useState<Record<Kind, boolean>>({ tag: true, heard: true, sighting: false });
   const [query, setQuery] = useState("");
   const [menuOpen, setMenuOpen] = useState(false);
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -131,6 +195,13 @@ export function PelagosApp() {
     };
   }, [load]);
 
+  const pending = Boolean(feed?.sources.some((source) => source.pending));
+  useEffect(() => {
+    if (!pending) return;
+    const timer = window.setTimeout(() => void load(false), 10_000);
+    return () => window.clearTimeout(timer);
+  }, [pending, feed, load]);
+
   useEffect(() => {
     setNow(Date.now());
     const timer = window.setInterval(() => setNow(Date.now()), 30_000);
@@ -153,24 +224,34 @@ export function PelagosApp() {
     const stamp = now ?? (Number.isFinite(parsed) ? parsed : Date.now());
     return signals.filter((signal) => {
       if (!groups[signal.group]) return false;
-      if (kind !== "all" && signal.kind !== kind) return false;
+      if (!layers[signal.kind]) return false;
       if (span !== null) {
         const at = Date.parse(signal.observedAt);
         if (!Number.isFinite(at) || stamp - at > span) return false;
       }
       return true;
     });
-  }, [feed, groups, windowKey, kind, now]);
+  }, [feed, groups, windowKey, layers, now]);
 
   const counts = useMemo(() => {
-    const tally = { whale: 0, shark: 0, dolphin: 0, hot: 0 };
-    const stamp = now ?? Date.now();
+    // Hydrophones count on their own: ten buoys are not ten whales.
+    const tally: Record<Group, number> = { whale: 0, shark: 0, dolphin: 0, other: 0 };
+    let heard = 0;
     for (const signal of visible) {
-      tally[signal.group] += 1;
-      if (stamp - Date.parse(signal.observedAt) < 48 * 3_600_000) tally.hot += 1;
+      if (signal.kind === "heard") heard += 1;
+      else tally[signal.group] += 1;
     }
-    return tally;
-  }, [visible, now]);
+    return { ...tally, heard };
+  }, [visible]);
+
+  /** Newest live events across every source, regardless of the layer toggles. */
+  const pulse = useMemo(() => {
+    if (now === null) return [];
+    return (feed?.signals ?? [])
+      .filter((signal) => groups[signal.group] && isLive(signal, now))
+      .sort((a, b) => Date.parse(b.observedAt) - Date.parse(a.observedAt))
+      .slice(0, 8);
+  }, [feed, groups, now]);
 
   const selected = (feed?.signals ?? []).find((signal) => signal.id === selectedId) ?? null;
   const mapSignals = useMemo(() => {
@@ -241,19 +322,26 @@ export function PelagosApp() {
         `${signal.name} ${signal.common} ${signal.scientific} ${signal.place ?? ""}`.toLowerCase().includes(q),
       )
     : visible;
+  const stamp = now ?? Date.now();
   const list = [...matched]
     .sort((a, b) => {
-      if (a.kind !== b.kind) return a.kind === "tag" ? -1 : 1;
-      return a.observedAt < b.observedAt ? 1 : -1;
+      const live = Number(isLive(b, stamp)) - Number(isLive(a, stamp));
+      if (live) return live;
+      if (a.kind !== b.kind) return KIND_ORDER[a.kind] - KIND_ORDER[b.kind];
+      return Date.parse(b.observedAt) - Date.parse(a.observedAt);
     })
     .slice(0, 160);
-  const movingCount = globeRoutes.length;
-  const recentTags = useMemo(() => {
+  const summary = useMemo(() => {
     const stamp = now ?? Date.now();
-    return visible.filter(
-      (signal) => signal.kind === "tag" && stamp - Date.parse(signal.observedAt) < 90 * 86_400_000,
-    ).length;
-  }, [visible, now]);
+    let pinged = 0;
+    let hearing = 0;
+    for (const signal of feed?.signals ?? []) {
+      if (signal.kind === "tag" && !signal.archive && stamp - Date.parse(signal.observedAt) < 7 * DAY_MS) pinged += 1;
+      if (signal.kind === "heard" && signal.heard?.recent.length) hearing += 1;
+    }
+    return { pinged, hearing };
+  }, [feed, now]);
+  const selectedRoute = selected ? globeRoutes.find((route) => route.id === selected.id) ?? null : null;
 
   return (
     <main className={`relative h-dvh overflow-hidden bg-bg text-fg${selected ? " has-lock" : ""}`}>
@@ -286,10 +374,11 @@ export function PelagosApp() {
               </button>
             </div>
             <div className="pointer-events-none flex shrink-0 items-start gap-2">
-              <div className="hud-panel hidden items-center gap-4 px-4 py-3 md:flex">
-                <Count n={counts.whale} label="whales" />
-                <Count n={counts.shark} label="sharks" />
-                <Count n={counts.dolphin} label="dolphins" />
+              <div className="hud-panel hidden items-center gap-4 px-4 py-3 lg:flex">
+                {GROUPS.map((group) => (
+                  <Count key={group.id} n={counts[group.id]} label={group.count} />
+                ))}
+                {layers.heard ? <Count n={counts.heard} label="hydrophones" /> : null}
               </div>
               <Clock />
             </div>
@@ -308,17 +397,19 @@ export function PelagosApp() {
                 total={matched.length}
                 groups={groups}
                 windowKey={windowKey}
-                kind={kind}
+                layers={layers}
                 query={query}
                 loading={loading}
                 error={error}
                 now={now}
+                fetchedAt={feed?.fetchedAt ?? null}
+                sources={feed?.sources ?? []}
                 selectedId={selectedId}
                 motion={motion}
                 onQuery={setQuery}
                 onGroup={(id) => setGroups((prev) => ({ ...prev, [id]: !prev[id] }))}
                 onWindow={setWindowKey}
-                onKind={setKind}
+                onLayer={(id) => setLayers((prev) => ({ ...prev, [id]: !prev[id] }))}
                 onSelect={choose}
                 onRefresh={() => void load(true)}
               />
@@ -331,30 +422,31 @@ export function PelagosApp() {
         <aside className="lock-card hud-panel">
           <Dossier
             signal={selected}
-            track={track}
-            trackState={trackState}
-            moving={globeRoutes.some((route) => route.id === selected.id)}
+            points={selected.archive ? (selectedRoute?.points ?? []) : (track?.points ?? [])}
+            trackError={track?.error ?? null}
+            trackState={selected.archive ? "ready" : trackState}
+            moving={Boolean(selectedRoute)}
             now={now}
             onRelease={() => setSelectedId(null)}
           />
         </aside>
       ) : (
         <div className="dock">
-          <Layers kind={kind} onKind={setKind} />
+          <Pulse items={pulse} now={now} onSelect={choose} />
+          <Layers layers={layers} onLayer={(id) => setLayers((prev) => ({ ...prev, [id]: !prev[id] }))} />
           <div className="legend hud-panel pointer-events-none px-3 py-2 font-mono text-xs text-fg">
+            {GROUPS.map((group) => (
+              <span key={group.id} className="inline-flex items-center gap-1">
+                <i className={`size-2.5 rounded-full ${pipClass(group.id)}`} /> {group.label}
+              </span>
+            ))}
             <span className="inline-flex items-center gap-1">
-              <i className="size-2.5 rounded-full bg-whale" /> Whales
-            </span>
-            <span className="inline-flex items-center gap-1">
-              <i className="size-2.5 rounded-full bg-shark" /> Sharks
-            </span>
-            <span className="inline-flex items-center gap-1">
-              <i className="size-2.5 rounded-full bg-dolphin" /> Dolphins
+              <i className="heard-ring" /> Hydrophone
             </span>
             <span className="text-muted">
-              {movingCount
-                ? `${movingCount} tags · ${recentTags} pinged lately`
-                : "Loading tracks"}
+              {loading
+                ? "Sweeping the basins…"
+                : `${summary.pinged} tags pinged this week · ${summary.hearing} hydrophones hearing whales`}
             </span>
           </div>
         </div>
@@ -363,25 +455,46 @@ export function PelagosApp() {
   );
 }
 
-function Layers({ kind, onKind }: { kind: Kind | "all"; onKind: (id: Kind | "all") => void }) {
-  const items: { id: Kind | "all"; label: string }[] = [
-    { id: "tag", label: "Live" },
-    { id: "all", label: "All" },
-    { id: "sighting", label: "Seen" },
-  ];
+function Layers({ layers, onLayer }: { layers: Record<Kind, boolean>; onLayer: (id: Kind) => void }) {
   return (
     <div className="layer-switch hud-panel" role="group" aria-label="Map layers">
-      {items.map((item) => (
-        <button
-          key={item.id}
-          type="button"
-          aria-pressed={kind === item.id}
-          onClick={() => onKind(item.id)}
-        >
+      {LAYERS.map((item) => (
+        <button key={item.id} type="button" aria-pressed={layers[item.id]} onClick={() => onLayer(item.id)}>
           {item.label}
         </button>
       ))}
     </div>
+  );
+}
+
+/** A rotating ticker of the newest live events; tapping one locks onto it. */
+function Pulse({ items, now, onSelect }: { items: Signal[]; now: number | null; onSelect: (id: string) => void }) {
+  const [index, setIndex] = useState(0);
+  const count = items.length;
+  useEffect(() => {
+    if (count < 2) return;
+    const timer = window.setInterval(() => setIndex((value) => (value + 1) % count), 5_000);
+    return () => window.clearInterval(timer);
+  }, [count]);
+  const item = count ? items[index % count] : null;
+  if (!item) return null;
+  const verb = item.kind === "heard" ? "heard" : "pinged";
+  return (
+    <button type="button" className="pulse hud-panel" onClick={() => onSelect(item.id)}>
+      <span className={`pulse-pip live-pip ${pipClass(item.group)}`} aria-hidden="true" />
+      <span className="pulse-tag">Live</span>
+      <span key={item.id} className="pulse-text">
+        <span className="text-fg">{item.name}</span>
+        <span className="text-muted">
+          {" "}
+          · {item.common} · {verb}{" "}
+          {now !== null ? whenLabel(item, now) : ""}
+        </span>
+      </span>
+      <span className="pulse-count tabular-nums">
+        {(index % count) + 1}/{count}
+      </span>
+    </button>
   );
 }
 
@@ -438,17 +551,19 @@ const ListPane = memo(function ListPane({
   total,
   groups,
   windowKey,
-  kind,
+  layers,
   query,
   loading,
   error,
   now,
+  fetchedAt,
+  sources,
   selectedId,
   motion,
   onQuery,
   onGroup,
   onWindow,
-  onKind,
+  onLayer,
   onSelect,
   onRefresh,
 }: {
@@ -456,17 +571,19 @@ const ListPane = memo(function ListPane({
   total: number;
   groups: Record<Group, boolean>;
   windowKey: WindowKey;
-  kind: Kind | "all";
+  layers: Record<Kind, boolean>;
   query: string;
   loading: boolean;
   error: string | null;
   now: number | null;
+  fetchedAt: string | null;
+  sources: SourceStatus[];
   selectedId: string | null;
   motion: Map<string, { kmh: number; dir: string }>;
   onQuery: (value: string) => void;
   onGroup: (id: Group) => void;
   onWindow: (id: WindowKey) => void;
-  onKind: (id: Kind | "all") => void;
+  onLayer: (id: Kind) => void;
   onSelect: (id: string) => void;
   onRefresh: () => void;
 }) {
@@ -474,7 +591,9 @@ const ListPane = memo(function ListPane({
     <>
       <div className="flex items-center justify-between gap-2 border-b border-line px-3 py-2">
         <p className="font-mono text-xs text-muted">
-          {loading ? "Sweeping the basins…" : `${total} signals`}
+          {loading
+            ? "Sweeping the basins…"
+            : `${total} signals${fetchedAt && now !== null ? ` · updated ${ageLabel(fetchedAt, now)}` : ""}`}
         </p>
         <button
           type="button"
@@ -516,17 +635,17 @@ const ListPane = memo(function ListPane({
               {item.label}
             </button>
           ))}
-          {(["all", "tag", "sighting"] as const).map((item) => (
+          {LAYERS.map((item) => (
             <button
-              key={item}
+              key={item.id}
               type="button"
-              aria-pressed={kind === item}
-              onClick={() => onKind(item)}
+              aria-pressed={layers[item.id]}
+              onClick={() => onLayer(item.id)}
               className={`min-h-11 rounded-full border px-3 font-mono text-xs ${
-                kind === item ? "border-line bg-surface-2 text-fg" : "border-line text-muted"
+                layers[item.id] ? "border-line bg-surface-2 text-fg" : "border-line text-muted"
               }`}
             >
-              {item === "all" ? "All" : item === "tag" ? "Live" : "Seen"}
+              {item.label}
             </button>
           ))}
         </div>
@@ -548,8 +667,11 @@ const ListPane = memo(function ListPane({
         ) : (
           <ul>
             {list.map((signal) => {
-              const hot = now !== null && now - Date.parse(signal.observedAt) < 48 * 3_600_000;
+              const hot = now !== null && isLive(signal, now);
               const leg = motion.get(signal.id);
+              const label = signal.archive
+                ? "ARCHIVE"
+                : (LAYERS.find((item) => item.id === signal.kind)?.tag ?? "");
               return (
                 <li key={signal.id}>
                   <button
@@ -562,13 +684,13 @@ const ListPane = memo(function ListPane({
                     <span
                       className={`mt-1.5 size-2.5 shrink-0 rounded-full ${pipClass(signal.group)} ${
                         hot ? "live-pip" : ""
-                      }`}
+                      } ${signal.kind === "heard" ? "heard-pip" : ""}`}
                     />
                     <span className="min-w-0 flex-1">
                       <span className="flex items-baseline justify-between gap-2">
                         <span className="truncate font-display text-base text-fg">{signal.name}</span>
-                        <span className="shrink-0 font-mono text-xs text-muted">
-                          {signal.kind === "tag" ? "TAG" : "SEEN"}
+                        <span className={`shrink-0 font-mono text-xs ${hot ? "text-phosphor" : "text-muted"}`}>
+                          {label}
                         </span>
                       </span>
                       <span className="block truncate font-mono text-xs text-muted">
@@ -576,7 +698,7 @@ const ListPane = memo(function ListPane({
                         {signal.scientific ? ` · ${signal.scientific}` : ""}
                       </span>
                       <span className="block truncate font-mono text-xs text-muted">
-                        {now ? ageLabel(signal.observedAt, now) : formatUtc(signal.observedAt)}
+                        {whenLabel(signal, now)}
                         {leg ? ` · ${pace(leg)}` : ""}
                         {signal.place ? ` · ${signal.place}` : ""}
                       </span>
@@ -587,29 +709,75 @@ const ListPane = memo(function ListPane({
             })}
           </ul>
         )}
+        <Sources sources={sources} />
       </div>
     </>
   );
 });
 
+function sourceDot(source: SourceStatus): string {
+  if (source.ok) return "bg-phosphor";
+  return source.pending ? "bg-dolphin" : "bg-shark";
+}
+
+function Sources({ sources }: { sources: SourceStatus[] }) {
+  if (!sources.length) return null;
+  return (
+    <details className="sources border-t border-line px-3 py-2">
+      <summary className="flex min-h-11 cursor-pointer items-center justify-between font-mono text-xs text-muted">
+        <span>Data sources</span>
+        <span className="flex gap-1.5" aria-hidden="true">
+          {sources.map((source) => (
+            <i key={source.id} className={`size-2 rounded-full ${sourceDot(source)}`} />
+          ))}
+        </span>
+      </summary>
+      <ul className="space-y-3 pb-2">
+        {sources.map((source) => (
+          <li key={source.id} className="font-mono text-xs">
+            <p className="flex items-center justify-between gap-2 text-fg">
+              <span className="inline-flex items-center gap-2">
+                <i className={`size-2 shrink-0 rounded-full ${sourceDot(source)}`} />
+                {source.label}
+              </span>
+              <span className="tabular-nums text-muted">{source.count}</span>
+            </p>
+            {source.note ? <p className="mt-1 pl-4 text-muted">{source.note}</p> : null}
+          </li>
+        ))}
+      </ul>
+    </details>
+  );
+}
+
 function Dossier({
   signal,
-  track,
+  points,
+  trackError,
   trackState,
   moving,
   now,
   onRelease,
 }: {
   signal: Signal;
-  track: Track | null;
+  points: TrackPoint[];
+  trackError: string | null;
   trackState: "idle" | "loading" | "ready" | "error";
   moving: boolean;
   now: number | null;
   onRelease: () => void;
 }) {
-  const points = track?.points ?? [];
   const km = points.length > 1 ? Math.round(pathKm(points)) : null;
-  const leg = trackLeg(points);
+  const leg = signal.archive ? null : trackLeg(points);
+  const groupLabel = GROUPS.find((group) => group.id === signal.group)?.label ?? signal.group;
+  const kindLabel =
+    signal.kind === "heard"
+      ? `${signal.heard?.platform ?? "listening"} hydrophone`
+      : signal.kind === "sighting"
+        ? "sighting"
+        : signal.archive
+          ? "archived study tag"
+          : "satellite tag";
   return (
     <div>
       <div className="flex items-center justify-between gap-2 border-b border-line px-3 py-2">
@@ -621,7 +789,7 @@ function Dossier({
       <div className="space-y-3 px-4 py-3">
         <div>
           <p className="font-mono text-xs uppercase tracking-widest text-muted">
-            {signal.group} · {signal.kind === "tag" ? "satellite tag" : "sighting"}
+            {groupLabel} · {kindLabel}
           </p>
           <h2 className="mt-1 font-display text-3xl leading-none text-fg">{signal.name}</h2>
           <p className="mt-2 font-mono text-sm text-muted">
@@ -629,27 +797,49 @@ function Dossier({
             {signal.scientific ? ` · ${signal.scientific}` : ""}
           </p>
         </div>
+        {signal.heard ? <CallGrid heard={signal.heard} /> : null}
         <dl className="grid grid-cols-2 gap-3 font-mono text-xs">
-          <Fact label="Last signal" value={now ? ageLabel(signal.observedAt, now) : formatUtc(signal.observedAt)} />
-          <Fact label="When" value={formatUtc(signal.observedAt)} />
+          <Fact
+            label={signal.kind === "heard" ? "Last call" : signal.archive ? "Last fix" : "Last signal"}
+            value={whenLabel(signal, now)}
+          />
+          <Fact
+            label="When"
+            value={signal.kind === "heard" ? signal.observedAt.slice(0, 10) : formatUtc(signal.observedAt)}
+          />
           {leg ? <Fact label="Course" value={pace(leg)} /> : null}
           {leg ? <Fact label="Heading" value={`${Math.round(leg.heading)}°`} /> : null}
           <Fact label="Latitude" value={signal.lat.toFixed(3)} />
           <Fact label="Longitude" value={signal.lng.toFixed(3)} />
           {signal.sex ? <Fact label="Sex" value={signal.sex} /> : null}
           {signal.length ? <Fact label="Length" value={signal.length} /> : null}
-          {signal.place ? <Fact label={signal.kind === "tag" ? "Tagged" : "Place"} value={signal.place} /> : null}
+          {signal.place ? (
+            <Fact
+              label={
+                signal.kind === "heard"
+                  ? "Operator"
+                  : signal.archive
+                    ? "Study"
+                    : signal.kind === "tag"
+                      ? "Tagged"
+                      : "Place"
+              }
+              value={signal.place}
+            />
+          ) : null}
         </dl>
         <p className="font-mono text-xs text-muted">
-          {signal.kind === "tag"
-            ? trackState === "loading"
-              ? "Pulling the ping history…"
-              : moving
-                ? `${points.length || "Recorded"} pings${km !== null ? ` · ${km.toLocaleString("en-US")} km` : ""}. The dot follows the latest pings.`
-                : track?.error
-                  ? track.error
-                  : "No stored path for this tag."
-            : "A sighting, not a tag. It stays where it was recorded."}
+          {signal.kind === "heard"
+            ? "Analysts review the platform's recordings every day. A call means the whale was within earshot of the hydrophone, not at this dot."
+            : signal.kind === "sighting"
+              ? "A sighting, not a tag. It stays where it was recorded."
+              : signal.archive
+                ? "The study has ended and this tag no longer transmits. The line traces a simplified version of its recorded route."
+                : trackState === "loading"
+                  ? "Pulling the ping history…"
+                  : moving
+                    ? `${points.length || "Recorded"} pings${km !== null ? ` · ${km.toLocaleString("en-US")} km` : ""}. The dot follows the latest pings.`
+                    : (trackError ?? "No stored path for this tag.")}
         </p>
         {signal.url ? (
           <a
@@ -658,10 +848,56 @@ function Dossier({
             rel="noreferrer"
             className="inline-flex min-h-11 items-center font-mono text-xs text-phosphor"
           >
-            {signal.source === "ocearch" ? "Open on OCEARCH" : "Open on iNaturalist"}
+            {SOURCE_LINK[signal.source]}
           </a>
         ) : null}
       </div>
+    </div>
+  );
+}
+
+const CALL_LABEL: Record<CallStatus, string> = {
+  detected: "detected",
+  possible: "possibly detected",
+  none: "not detected",
+};
+
+/** Species × day grid of analyst-reviewed calls, oldest day on the left. */
+function CallGrid({ heard }: { heard: Heard }) {
+  const days = heard.days.slice(0, 14).reverse();
+  if (!days.length) return null;
+  return (
+    <div className="call-grid font-mono text-xs">
+      <div className="call-grid-body" style={{ gridTemplateColumns: `5.5rem repeat(${days.length}, minmax(0, 1fr))` }}>
+        {heard.species.map((species, row) => (
+          <div key={species} className="contents">
+            <span className="truncate pr-2 text-muted">{species.replace(/\s+whales?$/i, "")}</span>
+            {days.map((day) => {
+              const call = day.calls[row] ?? "none";
+              return (
+                <span
+                  key={day.date}
+                  className={`call-cell call-${call}`}
+                  title={`${species} · ${day.date} · ${CALL_LABEL[call]}`}
+                />
+              );
+            })}
+          </div>
+        ))}
+      </div>
+      <p className="mt-2 flex flex-wrap items-center justify-between gap-2 text-muted">
+        <span>
+          {days[0].date.slice(5)} → {days[days.length - 1].date.slice(5)}
+        </span>
+        <span className="inline-flex items-center gap-3">
+          <span className="inline-flex items-center gap-1">
+            <i className="call-cell call-detected inline-block size-2.5" /> heard
+          </span>
+          <span className="inline-flex items-center gap-1">
+            <i className="call-cell call-possible inline-block size-2.5" /> maybe
+          </span>
+        </span>
+      </p>
     </div>
   );
 }

@@ -14,11 +14,12 @@ export const Route = createRootRoute({
       {
         name: "description",
         content:
-          "FinScape is a live world globe of satellite-tagged whales, sharks, and dolphins, plus research-grade sightings.",
+          "FinScape is a live world globe of satellite-tagged sharks, dolphins, sea turtles and seals, whale calls heard by ocean hydrophones, and research-grade sightings.",
       },
       { name: "theme-color", content: "#071016" },
     ],
     links: [
+      { rel: "icon", type: "image/svg+xml", href: "/favicon.svg" },
       { rel: "preload", as: "image", href: "/earth.jpg" },
       { rel: "stylesheet", href: appCss },
       { rel: "manifest", href: "/__grok/manifest.webmanifest" },

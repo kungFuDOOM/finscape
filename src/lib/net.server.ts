@@ -1,0 +1,95 @@
+import type { TrackPoint } from "./ocean.types";
+
+const UA = "FinScape/1.0 (educational live ocean map)";
+
+async function fetchOk<T>(
+  url: string,
+  timeoutMs: number,
+  accept: string,
+  read: (res: Response) => Promise<T>,
+): Promise<T> {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, {
+      signal: ctrl.signal,
+      headers: { Accept: accept, "Accept-Language": "en", "User-Agent": UA },
+      cache: "no-store",
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    // The body read stays inside the timeout so a stalled stream still aborts.
+    return await read(res);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+export function fetchJson(url: string, timeoutMs: number): Promise<unknown> {
+  return fetchOk(url, timeoutMs, "application/json", (res) => res.json());
+}
+
+export function fetchText(url: string, timeoutMs: number): Promise<string> {
+  return fetchOk(url, timeoutMs, "text/html,*/*", (res) => res.text());
+}
+
+export function asRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" ? (value as Record<string, unknown>) : null;
+}
+
+export function str(value: unknown): string | null {
+  return typeof value === "string" && value.trim() ? value.trim() : null;
+}
+
+export function num(value: unknown): number | null {
+  const n = typeof value === "number" ? value : typeof value === "string" ? Number(value) : NaN;
+  return Number.isFinite(n) ? n : null;
+}
+
+/** Sorts newest first by parsed time; ISO strings with mixed offsets do not sort as text. */
+export function byNewest<T extends { observedAt: string }>(a: T, b: T): number {
+  return (Date.parse(b.observedAt) || 0) - (Date.parse(a.observedAt) || 0);
+}
+
+export function downsample(points: TrackPoint[], max: number): TrackPoint[] {
+  if (points.length <= max) return points;
+  const tailCount = Math.min(12, Math.floor(max / 3));
+  const tail = points.slice(-tailCount);
+  const head = points.slice(0, -tailCount);
+  const budget = Math.max(1, max - tail.length);
+  if (head.length <= budget) return [...head, ...tail];
+  const step = Math.ceil(head.length / budget);
+  const kept = head.filter((_, index) => index % step === 0);
+  return [...kept, ...tail];
+}
+
+export async function pool<T, R>(items: T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
+  const out: R[] = new Array(items.length);
+  let cursor = 0;
+  async function worker() {
+    while (cursor < items.length) {
+      const index = cursor;
+      cursor += 1;
+      out[index] = await fn(items[index]);
+    }
+  }
+  const workers = Math.min(limit, items.length);
+  await Promise.all(Array.from({ length: workers }, () => worker()));
+  return out;
+}
+
+/** Resolves with the promise, or with `fallback` once `ms` passes; the promise keeps running. */
+export function within<T>(promise: Promise<T>, ms: number, fallback: T): Promise<T> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => resolve(fallback), ms);
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      () => {
+        clearTimeout(timer);
+        resolve(fallback);
+      },
+    );
+  });
+}

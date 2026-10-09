@@ -1,6 +1,22 @@
-export type Group = "whale" | "shark" | "dolphin";
-export type Kind = "tag" | "sighting";
-export type SourceId = "ocearch" | "inaturalist";
+export type Group = "whale" | "shark" | "dolphin" | "other";
+export type Kind = "tag" | "heard" | "sighting";
+export type SourceId = "ocearch" | "movebank" | "whoi" | "inaturalist";
+
+export type CallStatus = "detected" | "possible" | "none";
+
+/** One analyst-reviewed day from a WHOI listening platform. */
+export type HeardDay = {
+  date: string;
+  calls: CallStatus[];
+};
+
+/** Acoustic detail for a `heard` signal: which species the platform listens for, and what it heard. */
+export type Heard = {
+  platform: "buoy" | "glider";
+  species: string[];
+  recent: string[];
+  days: HeardDay[];
+};
 
 export type Signal = {
   id: string;
@@ -21,6 +37,9 @@ export type Signal = {
   image: string | null;
   url: string | null;
   tagId: number | null;
+  /** Archived study track: the animal is no longer transmitting. */
+  archive?: boolean;
+  heard?: Heard | null;
 };
 
 export type SourceStatus = {
@@ -29,6 +48,8 @@ export type SourceStatus = {
   ok: boolean;
   count: number;
   note: string | null;
+  /** Still loading on the server; ask again shortly. */
+  pending?: boolean;
 };
 
 export type Feed = {
