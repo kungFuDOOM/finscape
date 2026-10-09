@@ -22,8 +22,13 @@ const FRESH_FLOOR_MS = 30_000;
 const SIGHTING_TTL_MS = 15 * 60_000;
 const INAT_PAGE = 60;
 
-const THEATERS: Array<[string, number, number, number, number]> = [
-  ["ne-pacific", 18, -179, 66, -120],
+// [name, south, west, north, east, sightings per taxon]. Whale-watching coasts get their own
+// box: one ocean-wide box only returns its newest 60, which leaves busy coasts nearly empty.
+const THEATERS: Array<[string, number, number, number, number, number?]> = [
+  // East edge at 100°W reaches the Pacific coast of Mexico without crossing into the Gulf.
+  ["ne-pacific", 18, -179, 66, -100],
+  ["california", 22, -127, 42.5, -105, 200],
+  ["pacific-northwest", 42.5, -132, 51, -122, 120],
   ["central-pacific", -25, -179, 22, -130],
   ["se-pacific", -56, -160, 18, -68],
   ["nw-atlantic", 22, -98, 66, -40],
@@ -404,7 +409,7 @@ async function fetchInat(since: string): Promise<InatResult> {
 async function fetchInatBox(
   group: Group,
   taxon: string,
-  box: [string, number, number, number, number],
+  box: [string, number, number, number, number, number?],
   since: string,
 ): Promise<Signal[]> {
   const params = new URLSearchParams({
@@ -412,7 +417,7 @@ async function fetchInatBox(
     geo: "true",
     captive: "false",
     quality_grade: "research",
-    per_page: String(INAT_PAGE),
+    per_page: String(box[5] ?? INAT_PAGE),
     order_by: "observed_on",
     order: "desc",
     d1: since,
