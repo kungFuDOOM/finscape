@@ -108,6 +108,103 @@
   color: var(--color-fg);
 }
 
+.pulse {
+  pointer-events: auto;
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  min-height: 2.75rem;
+  max-width: 100%;
+  padding: 0 0.85rem;
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  text-align: left;
+}
+
+.pulse:hover {
+  border-color: var(--color-phosphor);
+}
+
+.pulse-pip {
+  width: 0.55rem;
+  height: 0.55rem;
+  flex: none;
+  border-radius: 999px;
+}
+
+.pulse-tag {
+  flex: none;
+  color: var(--color-phosphor);
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+.pulse-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  animation: pulse-in 0.4s ease-out;
+}
+
+.pulse-count {
+  flex: none;
+  color: var(--color-muted);
+}
+
+@keyframes pulse-in {
+  from {
+    opacity: 0;
+    transform: translateY(0.25rem);
+  }
+}
+
+.heard-ring {
+  display: inline-block;
+  width: 0.7rem;
+  height: 0.7rem;
+  border: 2px solid var(--color-whale);
+  border-radius: 999px;
+}
+
+.heard-pip {
+  background: transparent;
+  box-shadow: inset 0 0 0 2px currentColor;
+}
+
+.call-grid-body {
+  display: grid;
+  align-items: center;
+  gap: 3px;
+}
+
+.call-cell {
+  height: 0.8rem;
+  border-radius: 2px;
+  background: var(--color-surface-2);
+}
+
+.call-detected {
+  background: var(--color-whale);
+}
+
+.call-possible {
+  background: color-mix(in srgb, var(--color-whale) 40%, var(--color-surface-2));
+}
+
+.report {
+  border-left: 2px solid var(--color-line);
+  padding-left: 0.6rem;
+}
+
+.sources summary {
+  list-style: none;
+}
+
+.sources summary::-webkit-details-marker {
+  display: none;
+}
+
 .oceans {
   pointer-events: auto;
   display: flex;
@@ -223,7 +320,8 @@
 
 @media (prefers-reduced-motion: reduce) {
   .reticle-sweep,
-  .live-pip::after {
+  .live-pip::after,
+  .pulse-text {
     animation: none;
   }
 }
@@ -303,7 +401,7 @@
 
   .zoom-stack {
     right: max(0.75rem, env(safe-area-inset-right));
-    bottom: max(8.4rem, calc(env(safe-area-inset-bottom) + 7.6rem));
+    bottom: max(13.5rem, calc(env(safe-area-inset-bottom) + 12.75rem));
   }
 
   .lock-card {

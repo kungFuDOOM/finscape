@@ -1,5 +1,6 @@
 import { memo, useEffect, useRef } from "react";
 import { Minus, Plus } from "lucide-react";
+import { tileUrl } from "@/lib/feed-client";
 import type { Group, LiveRoute, Signal, TrackPoint } from "@/lib/ocean.types";
 
 const COLORS: Record<Group, string> = {
@@ -23,6 +24,8 @@ type Dot = {
   name: string;
   heading: number | null;
   fresh: boolean;
+  /** Hydrophone platforms: whether analysts heard whales in the last few reviews. */
+  hearing: boolean;
 };
 type Hit = { id: string; x: number; y: number };
 type View = { zoom: number; lng: number; lat: number };
@@ -237,7 +240,7 @@ function GlobeViewInner({ signals, routes, selectedId, onSelect, jump }: Props) 
     if (!ctx) return;
 
     const earth = new Image();
-    earth.src = "/earth.jpg";
+    earth.src = `${import.meta.env.BASE_URL}earth.jpg`;
     let earthPx: Uint8ClampedArray | null = null;
     let earthW = 0;
     let earthH = 0;
@@ -312,7 +315,9 @@ function GlobeViewInner({ signals, routes, selectedId, onSelect, jump }: Props) 
         tileClock = performance.now();
         dirty = true;
       };
-      img.src = `/api/sat/${z}/${y}/${wrapped}`;
+      // Tiles are read back as pixels, so they must load as CORS images.
+      img.crossOrigin = "anonymous";
+      img.src = tileUrl(z, y, wrapped);
       tiles.set(key, created);
       if (tiles.size > 180) {
         const oldest = tiles.keys().next().value;
@@ -612,9 +617,11 @@ function GlobeViewInner({ signals, routes, selectedId, onSelect, jump }: Props) 
           name: signal.name,
           heading: legs.get(signal.id)?.heading ?? null,
           fresh: Date.now() - Date.parse(signal.observedAt) < 120 * 86_400_000,
+          hearing: Boolean(signal.heard?.recent.length),
         };
       });
-      dots.sort((a, b) => Number(a.kind === "tag") - Number(b.kind === "tag"));
+      const layer = { sighting: 0, heard: 1, tag: 2 } as const;
+      dots.sort((a, b) => layer[a.kind] - layer[b.kind]);
       const focus = routesRef.current.find((route) => route.id === selectedRef.current)?.points ?? null;
       const hits: Hit[] = [];
       const put = (lat: number, lng: number) => project(lat, lng, b, w / 2, h / 2, radius);
@@ -642,6 +649,38 @@ function GlobeViewInner({ signals, routes, selectedId, onSelect, jump }: Props) 
       for (const dot of dots) {
         const p = put(dot.lat, dot.lng);
         if (!p || p.x < -24 || p.y < -24 || p.x > w + 24 || p.y > h + 24) continue;
+        if (dot.kind === "heard") {
+          const picked = dot.id === selectedRef.current;
+          const ring = (picked ? 9 : 5.5) * dotScale;
+          ctx.strokeStyle = COLORS[dot.group];
+          if (dot.hearing && !reduced) {
+            const phase = (now % 2400) / 2400;
+            ctx.globalAlpha = 0.6 * (1 - phase);
+            ctx.lineWidth = 1.5;
+            ctx.beginPath();
+            ctx.arc(p.x, p.y, ring * (1 + phase * 1.8), 0, Math.PI * 2);
+            ctx.stroke();
+          }
+          ctx.globalAlpha = dot.hearing ? 1 : 0.6;
+          ctx.lineWidth = 2;
+          ctx.beginPath();
+          ctx.arc(p.x, p.y, ring, 0, Math.PI * 2);
+          ctx.stroke();
+          ctx.fillStyle = COLORS[dot.group];
+          ctx.beginPath();
+          ctx.arc(p.x, p.y, ring * 0.32, 0, Math.PI * 2);
+          ctx.fill();
+          ctx.globalAlpha = 1;
+          if (picked) {
+            ctx.beginPath();
+            ctx.strokeStyle = "#f4fff8";
+            ctx.lineWidth = 1.5;
+            ctx.arc(p.x, p.y, ring + 5, 0, Math.PI * 2);
+            ctx.stroke();
+          }
+          hits.push({ id: dot.id, x: p.x, y: p.y });
+          continue;
+        }
         const sighting = dot.kind === "sighting";
         const quiet = dot.kind === "tag" && !dot.fresh;
         const size =
@@ -684,12 +723,12 @@ function GlobeViewInner({ signals, routes, selectedId, onSelect, jump }: Props) 
       const labeled: { x: number; y: number }[] = [];
       ctx.font = "600 12px IBM Plex Mono, ui-monospace, monospace";
       ctx.textBaseline = "middle";
+      const nameable = (dot: Dot) => dot.kind === "tag" || (dot.kind === "heard" && dot.hearing);
       const named = [
-        ...dots.filter((dot) => dot.kind === "tag" && dot.id !== selectedRef.current),
+        ...dots.filter((dot) => nameable(dot) && dot.id !== selectedRef.current),
         ...dots.filter((dot) => dot.id === selectedRef.current),
       ];
       for (const dot of named) {
-        if (dot.kind !== "tag") continue;
         const picked = dot.id === selectedRef.current;
         if (!picked && (!dot.fresh || view.zoom < 1.15)) continue;
         const p = put(dot.lat, dot.lng);

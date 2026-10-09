@@ -12,3 +12,4 @@ artifacts
 *.log
 .env
 .env.*
+dist-pages

@@ -1,8 +1,20 @@
-import type { Feed, Group, LiveRoute, Signal, SourceStatus, Track, TrackPoint } from "./ocean.types";
+import { loadAcartia } from "./acartia.server";
+import { loadGhri } from "./ghri.server";
+import { downsample, MAPOTIC, motionPoints, readTrack, trackUrl } from "./motion";
+import { asRecord, byNewest, fetchJson, num, pool, str } from "./net.server";
+import type {
+  Feed,
+  Group,
+  LiveRoute,
+  Signal,
+  SourceStatus,
+  Track,
+  TrackPoint,
+} from "./ocean.types";
+import { loadWhoi } from "./whoi.server";
+import { loadSharkSmart } from "./sharksmart.server";
+import { loadWhaleTags } from "./wildlife.server";
 
-const UA = "FinScape/1.0 (educational live ocean map)";
-const MAP_ID = 3413;
-const MAPOTIC = `https://www.mapotic.com/api/v1/maps/${MAP_ID}`;
 const TTL_MS = 75_000;
 const INAT_PAGE = 60;
 
@@ -62,7 +74,13 @@ async function buildLiveRoutes(): Promise<LiveRoute[]> {
     olderRoutes = await fetchMotionRoutes(older);
     archiveRoutes = { at: Date.now(), data: olderRoutes };
   }
+  const [whales, makos] = await Promise.all([
+    loadWhaleTags().catch(() => null),
+    loadGhri().catch(() => null),
+  ]);
   const byId = new Map<string, LiveRoute>();
+  for (const route of [...(whales?.routes ?? []), ...(makos?.routes ?? [])])
+    byId.set(route.id, route);
   for (const route of olderRoutes) byId.set(route.id, route);
   for (const route of recentRoutes) byId.set(route.id, route);
   return [...byId.values()];
@@ -94,21 +112,7 @@ async function fetchMotionRoutes(tags: Signal[]): Promise<LiveRoute[]> {
 }
 
 function parseMotion(value: unknown): TrackPoint[] {
-  if (!Array.isArray(value)) return [];
-  const points: TrackPoint[] = [];
-  for (const row of value) {
-    const item = asRecord(row);
-    const point = asRecord(item?.point);
-    const coords = Array.isArray(point?.coordinates) ? point.coordinates : [];
-    const lng = num(coords[0]);
-    const lat = num(coords[1]);
-    const at = str(item?.dt_move);
-    if (lng === null || lat === null || !at) continue;
-    if (Math.abs(lat) > 90 || Math.abs(lng) > 180) continue;
-    points.push({ lat, lng, at });
-  }
-  points.sort((a, b) => (a.at < b.at ? -1 : 1));
-  return downsample(points, 56);
+  return downsample(motionPoints(value), 56);
 }
 
 export function loadSignals(fresh = false): Promise<Feed> {
@@ -128,6 +132,41 @@ export function loadSignals(fresh = false): Promise<Feed> {
         signals: [],
         sources: [
           { id: "ocearch", label: "OCEARCH satellite tags", ok: false, count: 0, note },
+          {
+            id: "wildlife",
+            label: "Whale satellite tags (Wildlife Computers)",
+            ok: false,
+            count: 0,
+            note,
+          },
+          {
+            id: "ghri",
+            label: "Guy Harvey Research Institute shark tags",
+            ok: false,
+            count: 0,
+            note,
+          },
+          {
+            id: "sharksmart",
+            label: "SharkSmart WA detections & sightings",
+            ok: false,
+            count: 0,
+            note,
+          },
+          {
+            id: "acartia",
+            label: "Acartia live sightings (Pacific Northwest)",
+            ok: false,
+            count: 0,
+            note,
+          },
+          {
+            id: "whoi",
+            label: "WHOI Robots4Whales listening platforms",
+            ok: false,
+            count: 0,
+            note,
+          },
           {
             id: "inaturalist",
             label: "iNaturalist research-grade sightings",
@@ -156,44 +195,39 @@ export async function loadTrack(tagId: number): Promise<Track> {
 
 async function buildFeed(): Promise<Feed> {
   const since = new Date(Date.now() - 400 * 86_400_000).toISOString().slice(0, 10);
-  const [tags, sightings] = await Promise.all([fetchOcearch(), fetchInat(since)]);
-  const signals = [...tags.signals, ...sightings.signals].sort((a, b) =>
-    a.observedAt < b.observedAt ? 1 : -1,
-  );
+  const [tags, whales, makos, wa, live, sightings, heard] = await Promise.all([
+    fetchOcearch(),
+    settle("wildlife", "Whale satellite tags (Wildlife Computers)", loadWhaleTags()),
+    settle("ghri", "Guy Harvey Research Institute shark tags", loadGhri()),
+    settle("sharksmart", "SharkSmart WA detections & sightings", loadSharkSmart()),
+    settle("acartia", "Acartia live sightings (Pacific Northwest)", loadAcartia()),
+    fetchInat(since),
+    settle("whoi", "WHOI Robots4Whales listening platforms", loadWhoi()),
+  ]);
+  const parts = [tags, whales, makos, wa, heard, live, sightings];
   return {
     fetchedAt: new Date().toISOString(),
-    signals,
-    sources: [tags.status, sightings.status],
+    signals: parts.flatMap((part) => part.signals).sort(byNewest),
+    sources: parts.map((part) => part.status),
   };
 }
 
-async function fetchJson(url: string, timeoutMs: number): Promise<unknown> {
-  const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
-  try {
-    const res = await fetch(url, {
-      signal: ctrl.signal,
-      headers: { Accept: "application/json", "Accept-Language": "en", "User-Agent": UA },
-      cache: "no-store",
-    });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    return await res.json();
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-function asRecord(value: unknown): Record<string, unknown> | null {
-  return value && typeof value === "object" ? (value as Record<string, unknown>) : null;
-}
-
-function str(value: unknown): string | null {
-  return typeof value === "string" && value.trim() ? value.trim() : null;
-}
-
-function num(value: unknown): number | null {
-  const n = typeof value === "number" ? value : typeof value === "string" ? Number(value) : NaN;
-  return Number.isFinite(n) ? n : null;
+/** A source that throws still reports itself, empty and marked down, instead of sinking the feed. */
+function settle(
+  id: SourceStatus["id"],
+  label: string,
+  load: Promise<{ signals: Signal[]; status: SourceStatus }>,
+): Promise<{ signals: Signal[]; status: SourceStatus }> {
+  return load.catch((error: unknown) => ({
+    signals: [],
+    status: {
+      id,
+      label,
+      ok: false,
+      count: 0,
+      note: error instanceof Error ? error.message : `${label} unreachable`,
+    },
+  }));
 }
 
 async function fetchOcearch(): Promise<{ signals: Signal[]; status: SourceStatus }> {
@@ -261,7 +295,9 @@ function ocearchFeature(feature: unknown): Signal | null {
     weight: str(props.weight),
     stage: str(props.stage_of_life),
     image: str(props.image),
-    url: slug ? `https://www.ocearch.org/tracker/detail/${slug}` : "https://www.ocearch.org/tracker/",
+    url: slug
+      ? `https://www.ocearch.org/tracker/detail/${slug}`
+      : "https://www.ocearch.org/tracker/",
     tagId: id,
   };
 }
@@ -394,7 +430,9 @@ function inatObservation(group: Group, value: unknown): Signal | null {
   const scientific = str(taxon?.name) ?? "";
   const common =
     str(taxon?.preferred_common_name) ?? str(row.species_guess) ?? (scientific || "Unknown");
-  const observedAt = str(row.time_observed_at) ?? (str(row.observed_on) ? `${str(row.observed_on)}T00:00:00Z` : null);
+  const observedAt =
+    str(row.time_observed_at) ??
+    (str(row.observed_on) ? `${str(row.observed_on)}T00:00:00Z` : null);
   if (!observedAt) return null;
   return {
     id: `inat:${id}`,
@@ -420,23 +458,7 @@ function inatObservation(group: Group, value: unknown): Signal | null {
 
 async function fetchTrack(tagId: number): Promise<Track> {
   try {
-    const data = await fetchJson(`${MAPOTIC}/pois/${tagId}/motion/with-meta/`, 20_000);
-    const root = asRecord(data);
-    const motion = Array.isArray(root?.motion) ? root.motion : [];
-    const points: TrackPoint[] = [];
-    for (const row of motion) {
-      const item = asRecord(row);
-      const point = asRecord(item?.point);
-      const coords = Array.isArray(point?.coordinates) ? point.coordinates : [];
-      const lng = num(coords[0]);
-      const lat = num(coords[1]);
-      const at = str(item?.dt_move);
-      if (lng === null || lat === null || !at) continue;
-      if (Math.abs(lat) > 90 || Math.abs(lng) > 180) continue;
-      points.push({ lat, lng, at });
-    }
-    points.sort((a, b) => (a.at < b.at ? -1 : 1));
-    return { tagId, points: downsample(points, 420), error: null };
+    return readTrack(tagId, await fetchJson(trackUrl(tagId), 20_000));
   } catch (error) {
     return {
       tagId,
@@ -444,31 +466,4 @@ async function fetchTrack(tagId: number): Promise<Track> {
       error: error instanceof Error ? error.message : "Track unavailable",
     };
   }
-}
-
-function downsample(points: TrackPoint[], max: number): TrackPoint[] {
-  if (points.length <= max) return points;
-  const tailCount = Math.min(12, Math.floor(max / 3));
-  const tail = points.slice(-tailCount);
-  const head = points.slice(0, -tailCount);
-  const budget = Math.max(1, max - tail.length);
-  if (head.length <= budget) return [...head, ...tail];
-  const step = Math.ceil(head.length / budget);
-  const kept = head.filter((_, index) => index % step === 0);
-  return [...kept, ...tail];
-}
-
-async function pool<T, R>(items: T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
-  const out: R[] = new Array(items.length);
-  let cursor = 0;
-  async function worker() {
-    while (cursor < items.length) {
-      const index = cursor;
-      cursor += 1;
-      out[index] = await fn(items[index]);
-    }
-  }
-  const workers = Math.min(limit, items.length);
-  await Promise.all(Array.from({ length: workers }, () => worker()));
-  return out;
 }
