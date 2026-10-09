@@ -24,6 +24,9 @@
 
   html,
   body {
+    /* The globe owns every drag: no rubber-band scrolling or pull-to-refresh behind it. */
+    overscroll-behavior: none;
+    overflow: hidden;
     background: var(--color-bg);
     color: var(--color-fg);
     font-family: var(--font-mono);
