@@ -125,7 +125,9 @@ async function readPlatform(platform: Platform): Promise<Signal | null> {
   const tableEnd = html.indexOf("</table>", review);
   const table = html.slice(review, tableEnd < 0 ? undefined : tableEnd);
   const header = table.match(/<tr>\s*<th[\s\S]*?<\/tr>/)?.[0] ?? "";
-  const species = [...header.matchAll(/<th[^>]*>([\s\S]*?)<\/th>/g)].map((cell) => decode(cell[1])).slice(1);
+  const species = [...header.matchAll(/<th[^>]*>([\s\S]*?)<\/th>/g)]
+    .map((cell) => decode(cell[1]))
+    .slice(1);
   if (!species.length) return null;
 
   const days: (HeardDay & { link: string })[] = [];
@@ -209,7 +211,8 @@ function lastPosition(html: string): { lat: number; lng: number } | null {
       if (!/^-?\d{1,2}\.\d+$/.test(cells[i]) || !/^-?\d{1,3}\.\d+$/.test(cells[i + 1])) continue;
       const lat = Number(cells[i]);
       const lng = Number(cells[i + 1]);
-      if (Math.abs(lat) <= 90 && Math.abs(lng) <= 180 && (lat !== 0 || lng !== 0)) found = { lat, lng };
+      if (Math.abs(lat) <= 90 && Math.abs(lng) <= 180 && (lat !== 0 || lng !== 0))
+        found = { lat, lng };
       break;
     }
   }

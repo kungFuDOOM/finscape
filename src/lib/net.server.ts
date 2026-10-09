@@ -62,7 +62,11 @@ export function downsample(points: TrackPoint[], max: number): TrackPoint[] {
   return [...kept, ...tail];
 }
 
-export async function pool<T, R>(items: T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
+export async function pool<T, R>(
+  items: T[],
+  limit: number,
+  fn: (item: T) => Promise<R>,
+): Promise<R[]> {
   const out: R[] = new Array(items.length);
   let cursor = 0;
   async function worker() {

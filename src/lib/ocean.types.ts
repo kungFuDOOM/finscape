@@ -1,6 +1,7 @@
 export type Group = "whale" | "shark" | "dolphin";
 export type Kind = "tag" | "heard" | "sighting";
-export type SourceId = "ocearch" | "wildlife" | "whoi" | "inaturalist";
+export type SourceId =
+  "ocearch" | "wildlife" | "ghri" | "sharksmart" | "whoi" | "acartia" | "inaturalist";
 
 export type CallStatus = "detected" | "possible" | "none";
 
@@ -37,6 +38,8 @@ export type Signal = {
   image: string | null;
   url: string | null;
   tagId: number | null;
+  /** The source's own words about this record, e.g. a spotter's report. */
+  note?: string | null;
   heard?: Heard | null;
 };
 

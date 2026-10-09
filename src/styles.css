@@ -192,6 +192,11 @@
   background: color-mix(in srgb, var(--color-whale) 40%, var(--color-surface-2));
 }
 
+.report {
+  border-left: 2px solid var(--color-line);
+  padding-left: 0.6rem;
+}
+
 .sources summary {
   list-style: none;
 }

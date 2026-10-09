@@ -1,7 +1,18 @@
+import { loadAcartia } from "./acartia.server";
+import { loadGhri } from "./ghri.server";
 import { asRecord, byNewest, downsample, fetchJson, num, pool, str } from "./net.server";
-import type { Feed, Group, LiveRoute, Signal, SourceStatus, Track, TrackPoint } from "./ocean.types";
+import type {
+  Feed,
+  Group,
+  LiveRoute,
+  Signal,
+  SourceStatus,
+  Track,
+  TrackPoint,
+} from "./ocean.types";
 import { loadWhoi } from "./whoi.server";
-import { loadWhaleTags, type WhaleTags } from "./wildlife.server";
+import { loadSharkSmart } from "./sharksmart.server";
+import { loadWhaleTags } from "./wildlife.server";
 
 const MAP_ID = 3413;
 const MAPOTIC = `https://www.mapotic.com/api/v1/maps/${MAP_ID}`;
@@ -64,9 +75,13 @@ async function buildLiveRoutes(): Promise<LiveRoute[]> {
     olderRoutes = await fetchMotionRoutes(older);
     archiveRoutes = { at: Date.now(), data: olderRoutes };
   }
-  const whales = await loadWhaleTags().catch(() => null);
+  const [whales, makos] = await Promise.all([
+    loadWhaleTags().catch(() => null),
+    loadGhri().catch(() => null),
+  ]);
   const byId = new Map<string, LiveRoute>();
-  for (const route of whales?.routes ?? []) byId.set(route.id, route);
+  for (const route of [...(whales?.routes ?? []), ...(makos?.routes ?? [])])
+    byId.set(route.id, route);
   for (const route of olderRoutes) byId.set(route.id, route);
   for (const route of recentRoutes) byId.set(route.id, route);
   return [...byId.values()];
@@ -132,8 +147,41 @@ export function loadSignals(fresh = false): Promise<Feed> {
         signals: [],
         sources: [
           { id: "ocearch", label: "OCEARCH satellite tags", ok: false, count: 0, note },
-          { id: "wildlife", label: "Whale satellite tags (Wildlife Computers)", ok: false, count: 0, note },
-          { id: "whoi", label: "WHOI Robots4Whales listening platforms", ok: false, count: 0, note },
+          {
+            id: "wildlife",
+            label: "Whale satellite tags (Wildlife Computers)",
+            ok: false,
+            count: 0,
+            note,
+          },
+          {
+            id: "ghri",
+            label: "Guy Harvey Research Institute shark tags",
+            ok: false,
+            count: 0,
+            note,
+          },
+          {
+            id: "sharksmart",
+            label: "SharkSmart WA detections & sightings",
+            ok: false,
+            count: 0,
+            note,
+          },
+          {
+            id: "acartia",
+            label: "Acartia live sightings (Pacific Northwest)",
+            ok: false,
+            count: 0,
+            note,
+          },
+          {
+            id: "whoi",
+            label: "WHOI Robots4Whales listening platforms",
+            ok: false,
+            count: 0,
+            note,
+          },
           {
             id: "inaturalist",
             label: "iNaturalist research-grade sightings",
@@ -162,41 +210,40 @@ export async function loadTrack(tagId: number): Promise<Track> {
 
 async function buildFeed(): Promise<Feed> {
   const since = new Date(Date.now() - 400 * 86_400_000).toISOString().slice(0, 10);
-  const [tags, whales, sightings, heard] = await Promise.all([
+  const [tags, whales, makos, wa, live, sightings, heard] = await Promise.all([
     fetchOcearch(),
-    loadWhaleTags().catch(
-      (error: unknown): WhaleTags => ({
-        signals: [],
-        routes: [],
-        status: {
-          id: "wildlife",
-          label: "Whale satellite tags (Wildlife Computers)",
-          ok: false,
-          count: 0,
-          note: error instanceof Error ? error.message : "Tag maps unreachable",
-        },
-      }),
-    ),
+    settle("wildlife", "Whale satellite tags (Wildlife Computers)", loadWhaleTags()),
+    settle("ghri", "Guy Harvey Research Institute shark tags", loadGhri()),
+    settle("sharksmart", "SharkSmart WA detections & sightings", loadSharkSmart()),
+    settle("acartia", "Acartia live sightings (Pacific Northwest)", loadAcartia()),
     fetchInat(since),
-    loadWhoi().catch((error: unknown) => ({
-      signals: [] as Signal[],
-      status: {
-        id: "whoi",
-        label: "WHOI Robots4Whales listening platforms",
-        ok: false,
-        count: 0,
-        note: error instanceof Error ? error.message : "WHOI unreachable",
-      } satisfies SourceStatus,
-    })),
+    settle("whoi", "WHOI Robots4Whales listening platforms", loadWhoi()),
   ]);
-  const signals = [...tags.signals, ...whales.signals, ...heard.signals, ...sightings.signals].sort(byNewest);
+  const parts = [tags, whales, makos, wa, heard, live, sightings];
   return {
     fetchedAt: new Date().toISOString(),
-    signals,
-    sources: [tags.status, whales.status, heard.status, sightings.status],
+    signals: parts.flatMap((part) => part.signals).sort(byNewest),
+    sources: parts.map((part) => part.status),
   };
 }
 
+/** A source that throws still reports itself, empty and marked down, instead of sinking the feed. */
+function settle(
+  id: SourceStatus["id"],
+  label: string,
+  load: Promise<{ signals: Signal[]; status: SourceStatus }>,
+): Promise<{ signals: Signal[]; status: SourceStatus }> {
+  return load.catch((error: unknown) => ({
+    signals: [],
+    status: {
+      id,
+      label,
+      ok: false,
+      count: 0,
+      note: error instanceof Error ? error.message : `${label} unreachable`,
+    },
+  }));
+}
 
 async function fetchOcearch(): Promise<{ signals: Signal[]; status: SourceStatus }> {
   const status: SourceStatus = {
@@ -263,7 +310,9 @@ function ocearchFeature(feature: unknown): Signal | null {
     weight: str(props.weight),
     stage: str(props.stage_of_life),
     image: str(props.image),
-    url: slug ? `https://www.ocearch.org/tracker/detail/${slug}` : "https://www.ocearch.org/tracker/",
+    url: slug
+      ? `https://www.ocearch.org/tracker/detail/${slug}`
+      : "https://www.ocearch.org/tracker/",
     tagId: id,
   };
 }
@@ -396,7 +445,9 @@ function inatObservation(group: Group, value: unknown): Signal | null {
   const scientific = str(taxon?.name) ?? "";
   const common =
     str(taxon?.preferred_common_name) ?? str(row.species_guess) ?? (scientific || "Unknown");
-  const observedAt = str(row.time_observed_at) ?? (str(row.observed_on) ? `${str(row.observed_on)}T00:00:00Z` : null);
+  const observedAt =
+    str(row.time_observed_at) ??
+    (str(row.observed_on) ? `${str(row.observed_on)}T00:00:00Z` : null);
   if (!observedAt) return null;
   return {
     id: `inat:${id}`,

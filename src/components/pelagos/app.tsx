@@ -43,6 +43,9 @@ const KIND_ORDER: Record<Kind, number> = { heard: 0, tag: 1, sighting: 2 };
 const SOURCE_LINK: Record<SourceId, string> = {
   ocearch: "Open on OCEARCH",
   wildlife: "Open the tracking project",
+  ghri: "Open on the GHRI shark tracker",
+  sharksmart: "Open SharkSmart WA",
+  acartia: "Open Acartia",
   whoi: "Open the WHOI platform page",
   inaturalist: "Open on iNaturalist",
 };
@@ -51,6 +54,8 @@ const DAY_MS = 86_400_000;
 
 const OCEANS = [
   { id: "patagonia", label: "Patagonia", lat: -44, lng: -58, zoom: 2.1 },
+  { id: "salish", label: "Salish Sea", lat: 48.4, lng: -123.4, zoom: 3.6 },
+  { id: "wa", label: "W. Australia", lat: -32.8, lng: 116.5, zoom: 3 },
   { id: "california", label: "California", lat: 34.5, lng: -121, zoom: 2.3 },
   { id: "atlantic", label: "Atlantic", lat: 38, lng: -60, zoom: 1.55 },
   { id: "gulf", label: "Gulf", lat: 26, lng: -86, zoom: 2 },
@@ -94,7 +99,11 @@ function dayLabel(iso: string, now: number): string {
     new Date(iso).getUTCMonth(),
     new Date(iso).getUTCDate(),
   );
-  const today = Date.UTC(new Date(now).getUTCFullYear(), new Date(now).getUTCMonth(), new Date(now).getUTCDate());
+  const today = Date.UTC(
+    new Date(now).getUTCFullYear(),
+    new Date(now).getUTCMonth(),
+    new Date(now).getUTCDate(),
+  );
   const days = Math.round((today - day) / DAY_MS);
   if (days <= 0) return "today";
   if (days === 1) return "yesterday";
@@ -103,7 +112,9 @@ function dayLabel(iso: string, now: number): string {
 
 function whenLabel(signal: Signal, now: number | null): string {
   if (now === null) return formatUtc(signal.observedAt);
-  return signal.kind === "heard" ? dayLabel(signal.observedAt, now) : ageLabel(signal.observedAt, now);
+  return signal.kind === "heard"
+    ? dayLabel(signal.observedAt, now)
+    : ageLabel(signal.observedAt, now);
 }
 
 /** Tags that pinged in the last 3 days and platforms that heard a whale in the last 3 reviews. */
@@ -145,7 +156,11 @@ export function PelagosApp() {
     dolphin: true,
   });
   const [windowKey, setWindowKey] = useState<WindowKey>("all");
-  const [layers, setLayers] = useState<Record<Kind, boolean>>({ tag: true, heard: true, sighting: false });
+  const [layers, setLayers] = useState<Record<Kind, boolean>>({
+    tag: true,
+    heard: true,
+    sighting: false,
+  });
   const [query, setQuery] = useState("");
   const [menuOpen, setMenuOpen] = useState(false);
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -153,7 +168,9 @@ export function PelagosApp() {
   const [trackState, setTrackState] = useState<"idle" | "loading" | "ready" | "error">("idle");
   const [now, setNow] = useState<number | null>(null);
   const [routes, setRoutes] = useState<LiveRoute[]>([]);
-  const [jump, setJump] = useState<{ id: number; lat: number; lng: number; zoom: number } | null>(null);
+  const [jump, setJump] = useState<{ id: number; lat: number; lng: number; zoom: number } | null>(
+    null,
+  );
   const jumpN = useRef(0);
   const menuRef = useRef<HTMLDivElement | null>(null);
 
@@ -310,7 +327,9 @@ export function PelagosApp() {
   const q = query.trim().toLowerCase();
   const matched = q
     ? visible.filter((signal) =>
-        `${signal.name} ${signal.common} ${signal.scientific} ${signal.place ?? ""}`.toLowerCase().includes(q),
+        `${signal.name} ${signal.common} ${signal.scientific} ${signal.place ?? ""}`
+          .toLowerCase()
+          .includes(q),
       )
     : visible;
   const stamp = now ?? Date.now();
@@ -332,7 +351,9 @@ export function PelagosApp() {
     }
     return { pinged, hearing };
   }, [feed, now]);
-  const selectedRoute = selected ? globeRoutes.find((route) => route.id === selected.id) ?? null : null;
+  const selectedRoute = selected
+    ? (globeRoutes.find((route) => route.id === selected.id) ?? null)
+    : null;
 
   return (
     <main className={`relative h-dvh overflow-hidden bg-bg text-fg${selected ? " has-lock" : ""}`}>
@@ -376,7 +397,12 @@ export function PelagosApp() {
           </div>
           <div className="oceans" role="group" aria-label="Jump to an ocean">
             {OCEANS.map((ocean) => (
-              <button key={ocean.id} type="button" className="hud-panel" onClick={() => goOcean(ocean)}>
+              <button
+                key={ocean.id}
+                type="button"
+                className="hud-panel"
+                onClick={() => goOcean(ocean)}
+              >
                 {ocean.label}
               </button>
             ))}
@@ -424,7 +450,10 @@ export function PelagosApp() {
       ) : (
         <div className="dock">
           <Pulse items={pulse} now={now} onSelect={choose} />
-          <Layers layers={layers} onLayer={(id) => setLayers((prev) => ({ ...prev, [id]: !prev[id] }))} />
+          <Layers
+            layers={layers}
+            onLayer={(id) => setLayers((prev) => ({ ...prev, [id]: !prev[id] }))}
+          />
           <div className="legend hud-panel pointer-events-none px-3 py-2 font-mono text-xs text-fg">
             {GROUPS.map((group) => (
               <span key={group.id} className="inline-flex items-center gap-1">
@@ -446,11 +475,22 @@ export function PelagosApp() {
   );
 }
 
-function Layers({ layers, onLayer }: { layers: Record<Kind, boolean>; onLayer: (id: Kind) => void }) {
+function Layers({
+  layers,
+  onLayer,
+}: {
+  layers: Record<Kind, boolean>;
+  onLayer: (id: Kind) => void;
+}) {
   return (
     <div className="layer-switch hud-panel" role="group" aria-label="Map layers">
       {LAYERS.map((item) => (
-        <button key={item.id} type="button" aria-pressed={layers[item.id]} onClick={() => onLayer(item.id)}>
+        <button
+          key={item.id}
+          type="button"
+          aria-pressed={layers[item.id]}
+          onClick={() => onLayer(item.id)}
+        >
           {item.label}
         </button>
       ))}
@@ -459,7 +499,15 @@ function Layers({ layers, onLayer }: { layers: Record<Kind, boolean>; onLayer: (
 }
 
 /** A rotating ticker of the newest live events; tapping one locks onto it. */
-function Pulse({ items, now, onSelect }: { items: Signal[]; now: number | null; onSelect: (id: string) => void }) {
+function Pulse({
+  items,
+  now,
+  onSelect,
+}: {
+  items: Signal[];
+  now: number | null;
+  onSelect: (id: string) => void;
+}) {
   const [index, setIndex] = useState(0);
   const count = items.length;
   useEffect(() => {
@@ -478,8 +526,7 @@ function Pulse({ items, now, onSelect }: { items: Signal[]; now: number | null; 
         <span className="text-fg">{item.name}</span>
         <span className="text-muted">
           {" "}
-          · {item.common} · {verb}{" "}
-          {now !== null ? whenLabel(item, now) : ""}
+          · {item.common} · {verb} {now !== null ? whenLabel(item, now) : ""}
         </span>
       </span>
       <span className="pulse-count tabular-nums">
@@ -503,7 +550,9 @@ function thinSightings(signals: Signal[]): Signal[] {
       const dLat = Math.abs(other.lat - signal.lat);
       let dLng = Math.abs(other.lng - signal.lng);
       if (dLng > 180) dLng = 360 - dLng;
-      return dLat < 0.4 && dLng < 0.4 && Math.abs(Date.parse(other.observedAt) - at) < 36 * 3_600_000;
+      return (
+        dLat < 0.4 && dLng < 0.4 && Math.abs(Date.parse(other.observedAt) - at) < 36 * 3_600_000
+      );
     });
     if (duplicate) continue;
     sightings.push(signal);
@@ -677,8 +726,12 @@ const ListPane = memo(function ListPane({
                     />
                     <span className="min-w-0 flex-1">
                       <span className="flex items-baseline justify-between gap-2">
-                        <span className="truncate font-display text-base text-fg">{signal.name}</span>
-                        <span className={`shrink-0 font-mono text-xs ${hot ? "text-phosphor" : "text-muted"}`}>
+                        <span className="truncate font-display text-base text-fg">
+                          {signal.name}
+                        </span>
+                        <span
+                          className={`shrink-0 font-mono text-xs ${hot ? "text-phosphor" : "text-muted"}`}
+                        >
                           {label}
                         </span>
                       </span>
@@ -756,10 +809,17 @@ function Dossier({
   onRelease: () => void;
 }) {
   const km = points.length > 1 ? Math.round(pathKm(points)) : null;
-  const leg = trackLeg(points);
+  // A heading from a fix weeks old says nothing about where the animal is going now.
+  const stale = now !== null && now - Date.parse(signal.observedAt) > 7 * DAY_MS;
+  const leg = stale ? null : trackLeg(points);
   const spanDays =
     points.length > 1
-      ? Math.max(1, Math.round((Date.parse(points[points.length - 1].at) - Date.parse(points[0].at)) / DAY_MS))
+      ? Math.max(
+          1,
+          Math.round(
+            (Date.parse(points[points.length - 1].at) - Date.parse(points[0].at)) / DAY_MS,
+          ),
+        )
       : null;
   const groupLabel = GROUPS.find((group) => group.id === signal.group)?.label ?? signal.group;
   const kindLabel =
@@ -767,12 +827,18 @@ function Dossier({
       ? `${signal.heard?.platform ?? "listening"} hydrophone`
       : signal.kind === "sighting"
         ? "sighting"
-        : "satellite tag";
+        : signal.source === "sharksmart"
+          ? "acoustic tag detection"
+          : "satellite tag";
   return (
     <div>
       <div className="flex items-center justify-between gap-2 border-b border-line px-3 py-2">
         <p className="font-mono text-xs tracking-widest text-phosphor">LOCK</p>
-        <button type="button" className="min-h-11 font-mono text-xs text-muted hover:text-fg" onClick={onRelease}>
+        <button
+          type="button"
+          className="min-h-11 font-mono text-xs text-muted hover:text-fg"
+          onClick={onRelease}
+        >
           Release
         </button>
       </div>
@@ -795,7 +861,11 @@ function Dossier({
           />
           <Fact
             label="When"
-            value={signal.kind === "heard" ? signal.observedAt.slice(0, 10) : formatUtc(signal.observedAt)}
+            value={
+              signal.kind === "heard"
+                ? signal.observedAt.slice(0, 10)
+                : formatUtc(signal.observedAt)
+            }
           />
           {leg ? <Fact label="Course" value={pace(leg)} /> : null}
           {leg ? <Fact label="Heading" value={`${Math.round(leg.heading)}°`} /> : null}
@@ -811,22 +881,27 @@ function Dossier({
               label={
                 signal.kind === "heard"
                   ? "Operator"
-                  : signal.source === "wildlife"
+                  : signal.source === "wildlife" || signal.source === "ghri"
                     ? "Project"
-                    : signal.kind === "tag"
-                      ? "Tagged"
-                      : "Place"
+                    : signal.source === "sharksmart" && signal.kind === "tag"
+                      ? "Receiver"
+                      : signal.kind === "tag"
+                        ? "Tagged"
+                        : "Place"
               }
               value={signal.place}
             />
           ) : null}
         </dl>
+        {signal.note ? <p className="report font-mono text-xs text-fg">{signal.note}</p> : null}
         <p className="font-mono text-xs text-muted">
           {signal.kind === "heard"
             ? "Analysts review the platform's recordings every day. A call means the whale was within earshot of the hydrophone, not at this dot."
             : signal.kind === "sighting"
               ? "A sighting, not a tag. It stays where it was recorded."
-              : trackState === "loading"
+              : signal.source === "sharksmart"
+                ? "The dot marks the receiver, not the shark's exact position."
+                : trackState === "loading"
                   ? "Pulling the ping history…"
                   : moving
                     ? `${km !== null ? `About ${km.toLocaleString("en-US")} km along the plotted path. ` : ""}The dot follows the latest pings.`
@@ -859,7 +934,10 @@ function CallGrid({ heard }: { heard: Heard }) {
   if (!days.length) return null;
   return (
     <div className="call-grid font-mono text-xs">
-      <div className="call-grid-body" style={{ gridTemplateColumns: `5.5rem repeat(${days.length}, minmax(0, 1fr))` }}>
+      <div
+        className="call-grid-body"
+        style={{ gridTemplateColumns: `5.5rem repeat(${days.length}, minmax(0, 1fr))` }}
+      >
         {heard.species.map((species, row) => (
           <div key={species} className="contents">
             <span className="truncate pr-2 text-muted">{species.replace(/\s+whales?$/i, "")}</span>
