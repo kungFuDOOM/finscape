@@ -164,10 +164,11 @@ export function PelagosApp({
   });
   // Most tags went quiet long ago; open on recent activity and keep the archive one tap away.
   const [windowKey, setWindowKey] = useState<WindowKey>("90d");
+  // Sightings are most of the coverage along busy coasts like California; show them from the start.
   const [layers, setLayers] = useState<Record<Kind, boolean>>({
     tag: true,
     heard: true,
-    sighting: false,
+    sighting: true,
   });
   const [query, setQuery] = useState("");
   const [menuOpen, setMenuOpen] = useState(false);
