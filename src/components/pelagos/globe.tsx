@@ -6,7 +6,6 @@ const COLORS: Record<Group, string> = {
   whale: "#3ee0c5",
   shark: "#ff5c45",
   dolphin: "#e2b15a",
-  other: "#c49bff",
 };
 
 const D2R = Math.PI / 180;
@@ -614,7 +613,7 @@ function GlobeViewInner({ signals, routes, selectedId, onSelect, jump }: Props) 
           kind: signal.kind,
           name: signal.name,
           heading: legs.get(signal.id)?.heading ?? null,
-          fresh: !signal.archive && Date.now() - Date.parse(signal.observedAt) < 120 * 86_400_000,
+          fresh: Date.now() - Date.parse(signal.observedAt) < 120 * 86_400_000,
           hearing: Boolean(signal.heard?.recent.length),
         };
       });

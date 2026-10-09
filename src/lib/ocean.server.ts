@@ -1,5 +1,4 @@
-import { cachedMovebank, loadMovebank, type MovebankData } from "./movebank.server";
-import { asRecord, byNewest, downsample, fetchJson, num, pool, str, within } from "./net.server";
+import { asRecord, byNewest, downsample, fetchJson, num, pool, str } from "./net.server";
 import type { Feed, Group, LiveRoute, Signal, SourceStatus, Track, TrackPoint } from "./ocean.types";
 import { loadWhoi } from "./whoi.server";
 
@@ -23,8 +22,6 @@ const TAXA: Array<{ group: Group; taxon: string }> = [
   { group: "whale", taxon: "424321,41434,41401,41457" },
   { group: "dolphin", taxon: "41479" },
   { group: "shark", taxon: "551307" },
-  // Sea turtles (Chelonioidea) and pinnipeds (Phocoidea).
-  { group: "other", taxon: "372234,372843" },
 ];
 
 type Cache = { at: number; data: Feed };
@@ -66,9 +63,7 @@ async function buildLiveRoutes(): Promise<LiveRoute[]> {
     olderRoutes = await fetchMotionRoutes(older);
     archiveRoutes = { at: Date.now(), data: olderRoutes };
   }
-  const archive = await within(loadMovebank(), 8_000, cachedMovebank());
   const byId = new Map<string, LiveRoute>();
-  for (const route of archive?.routes ?? []) byId.set(route.id, route);
   for (const route of olderRoutes) byId.set(route.id, route);
   for (const route of recentRoutes) byId.set(route.id, route);
   return [...byId.values()];
@@ -124,15 +119,6 @@ export function loadSignals(fresh = false): Promise<Feed> {
     .then((data) => {
       cache = { at: Date.now(), data };
       inflight = null;
-      if (data.sources.some((source) => source.id === "movebank" && source.pending)) {
-        // Fold the archive into this cached feed as soon as it lands, without a full rebuild.
-        void loadMovebank()
-          .then((archive) => {
-            if (cache?.data !== data) return;
-            cache = { at: cache.at, data: withArchive(data, archive) };
-          })
-          .catch(() => undefined);
-      }
       return data;
     })
     .catch((error: unknown) => {
@@ -143,7 +129,6 @@ export function loadSignals(fresh = false): Promise<Feed> {
         signals: [],
         sources: [
           { id: "ocearch", label: "OCEARCH satellite tags", ok: false, count: 0, note },
-          { id: "movebank", label: "Movebank archived study tracks", ok: false, count: 0, note },
           { id: "whoi", label: "WHOI Robots4Whales listening platforms", ok: false, count: 0, note },
           {
             id: "inaturalist",
@@ -173,8 +158,7 @@ export async function loadTrack(tagId: number): Promise<Track> {
 
 async function buildFeed(): Promise<Feed> {
   const since = new Date(Date.now() - 400 * 86_400_000).toISOString().slice(0, 10);
-  // Movebank is slow and archival: answer without it on a cold start, and pick it up next poll.
-  const [tags, sightings, heard, archive] = await Promise.all([
+  const [tags, sightings, heard] = await Promise.all([
     fetchOcearch(),
     fetchInat(since),
     loadWhoi().catch((error: unknown) => ({
@@ -187,36 +171,15 @@ async function buildFeed(): Promise<Feed> {
         note: error instanceof Error ? error.message : "WHOI unreachable",
       } satisfies SourceStatus,
     })),
-    within<MovebankData | null>(loadMovebank(), 6_000, cachedMovebank()),
   ]);
-  const archiveStatus: SourceStatus = archive?.status ?? {
-    id: "movebank",
-    label: "Movebank archived study tracks",
-    ok: false,
-    count: 0,
-    note: "Still loading the archive.",
-    pending: true,
-  };
-  const signals = [
-    ...tags.signals,
-    ...(archive?.signals ?? []),
-    ...heard.signals,
-    ...sightings.signals,
-  ].sort(byNewest);
+  const signals = [...tags.signals, ...heard.signals, ...sightings.signals].sort(byNewest);
   return {
     fetchedAt: new Date().toISOString(),
     signals,
-    sources: [tags.status, archiveStatus, heard.status, sightings.status],
+    sources: [tags.status, heard.status, sightings.status],
   };
 }
 
-function withArchive(feed: Feed, archive: MovebankData): Feed {
-  return {
-    ...feed,
-    signals: [...feed.signals, ...archive.signals].sort(byNewest),
-    sources: feed.sources.map((source) => (source.id === "movebank" ? archive.status : source)),
-  };
-}
 
 async function fetchOcearch(): Promise<{ signals: Signal[]; status: SourceStatus }> {
   const status: SourceStatus = {
@@ -239,7 +202,7 @@ async function fetchOcearch(): Promise<{ signals: Signal[]; status: SourceStatus
     status.count = signals.length;
     status.note = signals.length
       ? "Pings when a tag breaks the surface. Positions are last known, not a continuous fix."
-      : "No published marine animal tags in the feed.";
+      : "No published shark or dolphin tags in the feed.";
     return { signals, status };
   } catch (error) {
     status.note = error instanceof Error ? error.message : "OCEARCH unreachable";
@@ -297,7 +260,6 @@ function categoryName(value: unknown): string {
 function classifyOcearch(category: string, species: string): Group | null {
   const blob = `${category} ${species}`.toLowerCase();
   if (blob.includes("whale shark")) return "shark";
-  if (/turtle|seal|sea lion|walrus/.test(blob)) return "other";
   if (
     blob.includes("dolphin") ||
     blob.includes("pilot whale") ||

@@ -14,7 +14,7 @@ export const Route = createRootRoute({
       {
         name: "description",
         content:
-          "FinScape is a live world globe of satellite-tagged sharks, dolphins, sea turtles and seals, whale calls heard by ocean hydrophones, and research-grade sightings.",
+          "FinScape is a live world globe of satellite-tagged sharks and dolphins, whale calls heard by ocean hydrophones, and research-grade whale, shark, and dolphin sightings.",
       },
       { name: "theme-color", content: "#071016" },
     ],

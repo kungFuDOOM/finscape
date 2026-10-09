@@ -29,7 +29,6 @@ const GROUPS: { id: Group; label: string; count: string }[] = [
   { id: "whale", label: "Whales", count: "whales" },
   { id: "shark", label: "Sharks", count: "sharks" },
   { id: "dolphin", label: "Dolphins", count: "dolphins" },
-  { id: "other", label: "Turtles & seals", count: "turtles · seals" },
 ];
 
 const LAYERS: { id: Kind; label: string; tag: string }[] = [
@@ -43,7 +42,6 @@ const KIND_ORDER: Record<Kind, number> = { heard: 0, tag: 1, sighting: 2 };
 
 const SOURCE_LINK: Record<SourceId, string> = {
   ocearch: "Open on OCEARCH",
-  movebank: "Open the study on Movebank",
   whoi: "Open the WHOI platform page",
   inaturalist: "Open on iNaturalist",
 };
@@ -109,14 +107,13 @@ function whenLabel(signal: Signal, now: number | null): string {
 /** Tags that pinged in the last 3 days and platforms that heard a whale in the last 3 reviews. */
 function isLive(signal: Signal, now: number): boolean {
   if (signal.kind === "heard") return Boolean(signal.heard?.recent.length);
-  if (signal.kind !== "tag" || signal.archive) return false;
+  if (signal.kind !== "tag") return false;
   return now - Date.parse(signal.observedAt) < 3 * DAY_MS;
 }
 
 function pipClass(group: Group): string {
   if (group === "whale") return "bg-whale text-whale";
   if (group === "dolphin") return "bg-dolphin text-dolphin";
-  if (group === "other") return "bg-other text-other";
   return "bg-shark text-shark";
 }
 
@@ -144,7 +141,6 @@ export function PelagosApp() {
     whale: true,
     shark: true,
     dolphin: true,
-    other: true,
   });
   const [windowKey, setWindowKey] = useState<WindowKey>("all");
   const [layers, setLayers] = useState<Record<Kind, boolean>>({ tag: true, heard: true, sighting: false });
@@ -195,13 +191,6 @@ export function PelagosApp() {
     };
   }, [load]);
 
-  const pending = Boolean(feed?.sources.some((source) => source.pending));
-  useEffect(() => {
-    if (!pending) return;
-    const timer = window.setTimeout(() => void load(false), 10_000);
-    return () => window.clearTimeout(timer);
-  }, [pending, feed, load]);
-
   useEffect(() => {
     setNow(Date.now());
     const timer = window.setInterval(() => setNow(Date.now()), 30_000);
@@ -235,7 +224,7 @@ export function PelagosApp() {
 
   const counts = useMemo(() => {
     // Hydrophones count on their own: ten buoys are not ten whales.
-    const tally: Record<Group, number> = { whale: 0, shark: 0, dolphin: 0, other: 0 };
+    const tally: Record<Group, number> = { whale: 0, shark: 0, dolphin: 0 };
     let heard = 0;
     for (const signal of visible) {
       if (signal.kind === "heard") heard += 1;
@@ -336,7 +325,7 @@ export function PelagosApp() {
     let pinged = 0;
     let hearing = 0;
     for (const signal of feed?.signals ?? []) {
-      if (signal.kind === "tag" && !signal.archive && stamp - Date.parse(signal.observedAt) < 7 * DAY_MS) pinged += 1;
+      if (signal.kind === "tag" && stamp - Date.parse(signal.observedAt) < 7 * DAY_MS) pinged += 1;
       if (signal.kind === "heard" && signal.heard?.recent.length) hearing += 1;
     }
     return { pinged, hearing };
@@ -422,9 +411,9 @@ export function PelagosApp() {
         <aside className="lock-card hud-panel">
           <Dossier
             signal={selected}
-            points={selected.archive ? (selectedRoute?.points ?? []) : (track?.points ?? [])}
+            points={track?.points ?? []}
             trackError={track?.error ?? null}
-            trackState={selected.archive ? "ready" : trackState}
+            trackState={trackState}
             moving={Boolean(selectedRoute)}
             now={now}
             onRelease={() => setSelectedId(null)}
@@ -669,9 +658,7 @@ const ListPane = memo(function ListPane({
             {list.map((signal) => {
               const hot = now !== null && isLive(signal, now);
               const leg = motion.get(signal.id);
-              const label = signal.archive
-                ? "ARCHIVE"
-                : (LAYERS.find((item) => item.id === signal.kind)?.tag ?? "");
+              const label = LAYERS.find((item) => item.id === signal.kind)?.tag ?? "";
               return (
                 <li key={signal.id}>
                   <button
@@ -716,8 +703,7 @@ const ListPane = memo(function ListPane({
 });
 
 function sourceDot(source: SourceStatus): string {
-  if (source.ok) return "bg-phosphor";
-  return source.pending ? "bg-dolphin" : "bg-shark";
+  return source.ok ? "bg-phosphor" : "bg-shark";
 }
 
 function Sources({ sources }: { sources: SourceStatus[] }) {
@@ -768,16 +754,14 @@ function Dossier({
   onRelease: () => void;
 }) {
   const km = points.length > 1 ? Math.round(pathKm(points)) : null;
-  const leg = signal.archive ? null : trackLeg(points);
+  const leg = trackLeg(points);
   const groupLabel = GROUPS.find((group) => group.id === signal.group)?.label ?? signal.group;
   const kindLabel =
     signal.kind === "heard"
       ? `${signal.heard?.platform ?? "listening"} hydrophone`
       : signal.kind === "sighting"
         ? "sighting"
-        : signal.archive
-          ? "archived study tag"
-          : "satellite tag";
+        : "satellite tag";
   return (
     <div>
       <div className="flex items-center justify-between gap-2 border-b border-line px-3 py-2">
@@ -800,7 +784,7 @@ function Dossier({
         {signal.heard ? <CallGrid heard={signal.heard} /> : null}
         <dl className="grid grid-cols-2 gap-3 font-mono text-xs">
           <Fact
-            label={signal.kind === "heard" ? "Last call" : signal.archive ? "Last fix" : "Last signal"}
+            label={signal.kind === "heard" ? "Last call" : "Last signal"}
             value={whenLabel(signal, now)}
           />
           <Fact
@@ -818,11 +802,9 @@ function Dossier({
               label={
                 signal.kind === "heard"
                   ? "Operator"
-                  : signal.archive
-                    ? "Study"
-                    : signal.kind === "tag"
-                      ? "Tagged"
-                      : "Place"
+                  : signal.kind === "tag"
+                    ? "Tagged"
+                    : "Place"
               }
               value={signal.place}
             />
@@ -833,9 +815,7 @@ function Dossier({
             ? "Analysts review the platform's recordings every day. A call means the whale was within earshot of the hydrophone, not at this dot."
             : signal.kind === "sighting"
               ? "A sighting, not a tag. It stays where it was recorded."
-              : signal.archive
-                ? "The study has ended and this tag no longer transmits. The line traces a simplified version of its recorded route."
-                : trackState === "loading"
+              : trackState === "loading"
                   ? "Pulling the ping history…"
                   : moving
                     ? `${points.length || "Recorded"} pings${km !== null ? ` · ${km.toLocaleString("en-US")} km` : ""}. The dot follows the latest pings.`

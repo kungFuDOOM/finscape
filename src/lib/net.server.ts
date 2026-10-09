@@ -76,20 +76,3 @@ export async function pool<T, R>(items: T[], limit: number, fn: (item: T) => Pro
   await Promise.all(Array.from({ length: workers }, () => worker()));
   return out;
 }
-
-/** Resolves with the promise, or with `fallback` once `ms` passes; the promise keeps running. */
-export function within<T>(promise: Promise<T>, ms: number, fallback: T): Promise<T> {
-  return new Promise((resolve) => {
-    const timer = setTimeout(() => resolve(fallback), ms);
-    promise.then(
-      (value) => {
-        clearTimeout(timer);
-        resolve(value);
-      },
-      () => {
-        clearTimeout(timer);
-        resolve(fallback);
-      },
-    );
-  });
-}

@@ -1,6 +1,6 @@
-export type Group = "whale" | "shark" | "dolphin" | "other";
+export type Group = "whale" | "shark" | "dolphin";
 export type Kind = "tag" | "heard" | "sighting";
-export type SourceId = "ocearch" | "movebank" | "whoi" | "inaturalist";
+export type SourceId = "ocearch" | "whoi" | "inaturalist";
 
 export type CallStatus = "detected" | "possible" | "none";
 
@@ -37,8 +37,6 @@ export type Signal = {
   image: string | null;
   url: string | null;
   tagId: number | null;
-  /** Archived study track: the animal is no longer transmitting. */
-  archive?: boolean;
   heard?: Heard | null;
 };
 
@@ -48,8 +46,6 @@ export type SourceStatus = {
   ok: boolean;
   count: number;
   note: string | null;
-  /** Still loading on the server; ask again shortly. */
-  pending?: boolean;
 };
 
 export type Feed = {
