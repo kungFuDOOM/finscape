@@ -1,4 +1,4 @@
-export type Group = "whale" | "shark" | "dolphin";
+export type Group = "whale" | "shark" | "dolphin" | "turtle" | "seal";
 export type Kind = "tag" | "sighting";
 export type SourceId = "ocearch" | "inaturalist";
 
@@ -21,6 +21,8 @@ export type Signal = {
   image: string | null;
   url: string | null;
   tagId: number | null;
+  /** Who recorded it: the tagging program or the iNaturalist observer. */
+  credit: string | null;
 };
 
 export type SourceStatus = {

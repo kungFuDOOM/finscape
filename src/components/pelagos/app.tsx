@@ -26,7 +26,17 @@ const GROUPS: { id: Group; label: string }[] = [
   { id: "whale", label: "Whales" },
   { id: "shark", label: "Sharks" },
   { id: "dolphin", label: "Dolphins" },
+  { id: "turtle", label: "Turtles" },
+  { id: "seal", label: "Seals" },
 ];
+
+const ALL_GROUPS: Record<Group, boolean> = {
+  whale: true,
+  shark: true,
+  dolphin: true,
+  turtle: true,
+  seal: true,
+};
 
 const OCEANS = [
   { id: "california", label: "California", lat: 34.5, lng: -121, zoom: 2.3 },
@@ -67,6 +77,8 @@ function ageLabel(iso: string, now: number): string {
 function pipClass(group: Group): string {
   if (group === "whale") return "bg-whale text-whale";
   if (group === "dolphin") return "bg-dolphin text-dolphin";
+  if (group === "turtle") return "bg-turtle text-turtle";
+  if (group === "seal") return "bg-seal text-seal";
   return "bg-shark text-shark";
 }
 
@@ -105,7 +117,7 @@ export function PelagosApp({
   const [feed, setFeed] = useState<Feed | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
-  const [groups, setGroups] = useState<Record<Group, boolean>>({ whale: true, shark: true, dolphin: true });
+  const [groups, setGroups] = useState<Record<Group, boolean>>(ALL_GROUPS);
   const [windowKey, setWindowKey] = useState<WindowKey>("all");
   const [kind, setKind] = useState<Kind | "all">("tag");
   const [query, setQuery] = useState("");
@@ -215,7 +227,14 @@ export function PelagosApp({
   }, [feed, groups, windowKey, kind, now]);
 
   const counts = useMemo(() => {
-    const tally = { whale: 0, shark: 0, dolphin: 0, hot: 0 };
+    const tally: Record<Group, number> & { hot: number } = {
+      whale: 0,
+      shark: 0,
+      dolphin: 0,
+      turtle: 0,
+      seal: 0,
+      hot: 0,
+    };
     const stamp = now ?? Date.now();
     for (const signal of visible) {
       tally[signal.group] += 1;
@@ -362,9 +381,9 @@ export function PelagosApp({
             </div>
             <div className="pointer-events-none flex shrink-0 items-start gap-2">
               <div className="hud-panel hidden items-center gap-4 px-4 py-3 md:flex">
-                <Count n={counts.whale} label="whales" />
-                <Count n={counts.shark} label="sharks" />
-                <Count n={counts.dolphin} label="dolphins" />
+                {GROUPS.map((group) => (
+                  <Count key={group.id} n={counts[group.id]} label={group.label.toLowerCase()} />
+                ))}
               </div>
               <Clock />
             </div>
@@ -433,15 +452,11 @@ export function PelagosApp({
             </button>
           </div>
           <div className="legend hud-panel pointer-events-none px-3 py-2 font-mono text-xs text-fg">
-            <span className="inline-flex items-center gap-1">
-              <i className="size-2.5 rounded-full bg-whale" /> Whales
-            </span>
-            <span className="inline-flex items-center gap-1">
-              <i className="size-2.5 rounded-full bg-shark" /> Sharks
-            </span>
-            <span className="inline-flex items-center gap-1">
-              <i className="size-2.5 rounded-full bg-dolphin" /> Dolphins
-            </span>
+            {GROUPS.map((group) => (
+              <span key={group.id} className="inline-flex items-center gap-1">
+                <i className={`size-2.5 rounded-full ${pipClass(group.id)}`} /> {group.label}
+              </span>
+            ))}
             <span className={health === "down" ? "text-shark" : "text-muted"}>
               {health === "loading"
                 ? "Sweeping the basins…"
@@ -846,6 +861,7 @@ function Dossier({
           {signal.length ? <Fact label="Length" value={signal.length} /> : null}
           {signal.weight ? <Fact label="Weight" value={signal.weight} /> : null}
           {signal.stage ? <Fact label="Life stage" value={signal.stage} /> : null}
+          {signal.credit ? <Fact label={signal.kind === "tag" ? "Tagged by" : "Observed by"} value={signal.credit} /> : null}
           {signal.place ? <Fact label={signal.kind === "tag" ? "Tagged" : "Place"} value={signal.place} /> : null}
         </dl>
         <p className="font-mono text-xs text-muted">

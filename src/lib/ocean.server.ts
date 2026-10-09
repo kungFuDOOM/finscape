@@ -21,11 +21,15 @@ const THEATERS: Array<[string, number, number, number, number]> = [
   ["west-pacific", -48, 100, 45, 179],
 ];
 
-const TAXA: Array<{ group: Group; taxon: string }> = [
+// Either fixed iNaturalist taxon ids, or taxon names resolved to ids once at runtime.
+const TAXA: Array<{ group: Group; taxon?: string; names?: string[] }> = [
   { group: "whale", taxon: "424321,41434,41401,41457" },
   { group: "dolphin", taxon: "41479" },
   { group: "shark", taxon: "551307" },
+  { group: "turtle", names: ["Cheloniidae", "Dermochelyidae"] },
+  { group: "seal", names: ["Phocidae", "Otariidae", "Odobenidae"] },
 ];
+const resolvedTaxa = new Map<Group, string>();
 
 type Cache = { at: number; data: Feed };
 let cache: Cache | null = null;
@@ -236,7 +240,7 @@ async function fetchOcearch(): Promise<{ signals: Signal[]; status: SourceStatus
     status.count = signals.length;
     status.note = signals.length
       ? "Pings when a tag breaks the surface. Positions are last known, not a continuous fix."
-      : "No published shark or dolphin tags in the feed.";
+      : "No published marine tags in the feed.";
     return { signals, status };
   } catch (error) {
     status.note = error instanceof Error ? error.message : "OCEARCH unreachable";
@@ -282,6 +286,7 @@ function ocearchFeature(feature: unknown): Signal | null {
     image: str(props.image),
     url: slug ? `https://www.ocearch.org/tracker/detail/${slug}` : "https://www.ocearch.org/tracker/",
     tagId: id,
+    credit: "OCEARCH",
   };
 }
 
@@ -294,6 +299,8 @@ function categoryName(value: unknown): string {
 function classifyOcearch(category: string, species: string): Group | null {
   const blob = `${category} ${species}`.toLowerCase();
   if (blob.includes("whale shark")) return "shark";
+  if (/turtle|ridley|loggerhead|leatherback|hawksbill/.test(blob)) return "turtle";
+  if (/\bseals?\b|sea lion|walrus/.test(blob)) return "seal";
   if (
     blob.includes("dolphin") ||
     blob.includes("pilot whale") ||
@@ -326,19 +333,26 @@ async function fetchInat(since: string): Promise<InatResult> {
     count: 0,
     note: null,
   };
+  const taxonIds = new Map<Group, string>();
+  await Promise.all(
+    TAXA.map(async (taxa) => {
+      const id = taxa.taxon ?? (await resolveTaxa(taxa.group, taxa.names ?? []));
+      if (id) taxonIds.set(taxa.group, id);
+    }),
+  );
   const jobs: Array<{ group: Group; theater: string }> = [];
-  for (const taxa of TAXA) {
-    for (const theater of THEATERS) jobs.push({ group: taxa.group, theater: theater[0] });
+  for (const group of taxonIds.keys()) {
+    for (const theater of THEATERS) jobs.push({ group, theater: theater[0] });
   }
   let failed = 0;
   const seen = new Set<string>();
   const signals: Signal[] = [];
   const rows = await pool(jobs, 8, async (job) => {
-    const taxa = TAXA.find((item) => item.group === job.group);
+    const taxon = taxonIds.get(job.group);
     const box = THEATERS.find((item) => item[0] === job.theater);
-    if (!taxa || !box) return [];
+    if (!taxon || !box) return [];
     try {
-      return await fetchInatBox(taxa.group, taxa.taxon, box, since);
+      return await fetchInatBox(job.group, taxon, box, since);
     } catch {
       failed += 1;
       return [];
@@ -351,16 +365,47 @@ async function fetchInat(since: string): Promise<InatResult> {
       signals.push(signal);
     }
   }
-  status.ok = signals.length > 0 || failed < jobs.length;
+  status.ok = jobs.length > 0 && (signals.length > 0 || failed < jobs.length);
   status.count = signals.length;
   status.note =
-    failed === jobs.length
+    !jobs.length || failed === jobs.length
       ? "iNaturalist did not answer."
       : failed > 0
         ? `${failed} ocean sectors timed out. Showing the rest. Obscured coordinates are dropped.`
         : "Latest research-grade, non-obscured sightings in each ocean, refreshed from the public API.";
   if (failed === jobs.length) status.ok = false;
   return { signals, status };
+}
+
+/** Looks up iNaturalist ids for taxon names (exact, active matches only); remembered once found. */
+async function resolveTaxa(group: Group, names: string[]): Promise<string | null> {
+  const known = resolvedTaxa.get(group);
+  if (known) return known;
+  const ids: number[] = [];
+  await Promise.all(
+    names.map(async (name) => {
+      try {
+        const params = new URLSearchParams({ q: name, is_active: "true", per_page: "10" });
+        const data = await fetchJson(`https://api.inaturalist.org/v1/taxa?${params}`, 10_000);
+        const results = Array.isArray(asRecord(data)?.results) ? (asRecord(data)!.results as unknown[]) : [];
+        for (const result of results) {
+          const row = asRecord(result);
+          const id = num(row?.id);
+          if (id !== null && str(row?.name)?.toLowerCase() === name.toLowerCase()) {
+            ids.push(id);
+            break;
+          }
+        }
+      } catch {
+        /* that family stays out until the next pull */
+      }
+    }),
+  );
+  if (!ids.length) return null;
+  const joined = ids.sort((a, b) => a - b).join(",");
+  // Only remember a complete lookup, so a partial one is retried.
+  if (ids.length === names.length) resolvedTaxa.set(group, joined);
+  return joined;
 }
 
 async function fetchInatBox(
@@ -383,7 +428,7 @@ async function fetchInatBox(
     nelat: String(box[3]),
     nelng: String(box[4]),
     fields:
-      "id,species_guess,location,observed_on,time_observed_at,place_guess,uri,obscured,geoprivacy,taxon.name,taxon.preferred_common_name",
+      "id,species_guess,location,observed_on,time_observed_at,place_guess,uri,obscured,geoprivacy,taxon.name,taxon.preferred_common_name,photos.url,user.login",
   });
   const data = await fetchJson(`https://api.inaturalist.org/v2/observations?${params}`, 12_000);
   const root = asRecord(data);
@@ -415,6 +460,11 @@ function inatObservation(group: Group, value: unknown): Signal | null {
     str(taxon?.preferred_common_name) ?? str(row.species_guess) ?? (scientific || "Unknown");
   const observedAt = str(row.time_observed_at) ?? (str(row.observed_on) ? `${str(row.observed_on)}T00:00:00Z` : null);
   if (!observedAt) return null;
+  const photos = Array.isArray(row.photos) ? row.photos : [];
+  const thumb = str(asRecord(photos[0])?.url);
+  // iNaturalist hands back the square thumbnail; the medium size suits the dossier.
+  const image = thumb ? thumb.replace("/square.", "/medium.") : null;
+  const login = str(asRecord(row.user)?.login);
   return {
     id: `inat:${id}`,
     name: common,
@@ -431,9 +481,10 @@ function inatObservation(group: Group, value: unknown): Signal | null {
     length: null,
     weight: null,
     stage: null,
-    image: null,
+    image,
     url: str(row.uri) ?? `https://www.inaturalist.org/observations/${id}`,
     tagId: null,
+    credit: login ? `@${login} on iNaturalist` : "iNaturalist",
   };
 }
 

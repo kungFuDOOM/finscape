@@ -6,6 +6,8 @@ const COLORS: Record<Group, string> = {
   whale: "#3ee0c5",
   shark: "#ff5c45",
   dolphin: "#e2b15a",
+  turtle: "#8fd16a",
+  seal: "#a99bff",
 };
 
 const D2R = Math.PI / 180;
@@ -24,6 +26,8 @@ type Dot = {
   common: string;
   heading: number | null;
   fresh: boolean;
+  hot: boolean;
+  phase: number;
 };
 type Hit = { id: string; x: number; y: number };
 type View = { zoom: number; lng: number; lat: number };
@@ -231,6 +235,12 @@ function makeStars(count: number): { x: number; y: number; r: number; a: number 
 
 const STARS = makeStars(240);
 
+function phaseFor(id: string): number {
+  let hash = 0;
+  for (let i = 0; i < id.length; i += 1) hash = (hash * 31 + id.charCodeAt(i)) | 0;
+  return ((hash >>> 0) % 1000) / 1000;
+}
+
 function tileX(lng: number, z: number): number {
   return ((lng + 180) / 360) * 2 ** z;
 }
@@ -352,7 +362,8 @@ function GlobeViewInner({ signals, routes, selectedId, onSelect, jump }: Props) 
     };
 
     const sample = (lat: number, lng: number, z: number): [number, number, number] => {
-      for (let level = z; level >= 3; level -= 1) {
+      // Web Mercator tiles stop at ±85°; the poles come from the base texture.
+      for (let level = Math.abs(lat) < 84.5 ? z : 0; level >= 3; level -= 1) {
         const tx = tileX(lng, level);
         const ty = tileY(lat, level);
         const ix = Math.floor(tx);
@@ -516,8 +527,11 @@ function GlobeViewInner({ signals, routes, selectedId, onSelect, jump }: Props) 
       // The idle spin is slow and the whole globe fits on screen, so it can afford full resolution.
       const idleSpin = spin && !movingCamera && radius * radius * Math.PI < 700_000;
       const stride = (movingCamera || spin || settling) && !idleSpin ? (w * h > 900000 ? 3 : 2) : 1;
-      const bw = Math.max(2, Math.ceil(w / stride));
-      const bh = Math.max(2, Math.ceil(h / stride));
+      // Once the camera rests, render the terrain at device resolution so retina screens stay crisp.
+      const scale = !movingCamera && !spin && !settling ? dpr : 1;
+      const px = stride / scale;
+      const bw = Math.max(2, Math.ceil(w / px));
+      const bh = Math.max(2, Math.ceil(h / px));
       if (!terrain || terrain.width !== bw || terrain.height !== bh) {
         terrain = document.createElement("canvas");
         terrain.width = bw;
@@ -539,10 +553,21 @@ function GlobeViewInner({ signals, routes, selectedId, onSelect, jump }: Props) 
         // Night shading fades out as you zoom in, so close-up imagery stays readable.
         const night = clamp((3 - view.zoom) / 2, 0, 1) * 0.55;
         const [sx0, sy0, sz0] = sun;
+        // Sun glint: the half-vector between the sun and the viewer.
+        let hx = sx0 + b.fx;
+        let hy = sy0 + b.fy;
+        let hz = sz0 + b.fz;
+        const hl = Math.hypot(hx, hy, hz) || 1;
+        hx /= hl;
+        hy /= hl;
+        hz /= hl;
+        const glint = night > 0 ? night / 0.55 : 0;
         const detail =
           radius > Math.min(w, h) * 0.72
             ? clamp(Math.round(Math.log2(((radius * Math.PI) / 180) * (360 / 256))), 3, 10)
-            : 0;
+            : scale > 1 && radius * dpr >= 420
+              ? 3
+              : 0;
         if (detail >= 3) {
           const tilePx = ((360 / 2 ** detail) * radius * Math.PI) / 180;
           const step = Math.max(36, Math.min(tilePx * 0.75, 240));
@@ -570,10 +595,10 @@ function GlobeViewInner({ signals, routes, selectedId, onSelect, jump }: Props) 
           }
         }
         for (let y = 0; y < bh; y += 1) {
-          const ny = (cy - (y + 0.5) * stride) / radius;
+          const ny = (cy - (y + 0.5) * px) / radius;
           const row = y * bw;
           for (let x = 0; x < bw; x += 1) {
-            const nx = ((x + 0.5) * stride - cx) / radius;
+            const nx = ((x + 0.5) * px - cx) / radius;
             const i = (row + x) * 4;
             const r2 = nx * nx + ny * ny;
             if (r2 > 1) {
@@ -593,9 +618,18 @@ function GlobeViewInner({ signals, routes, selectedId, onSelect, jump }: Props) 
               const t = clamp((wx * sx0 + wy * sy0 + wz * sz0 + 0.1) / 0.2, 0, 1);
               dark = night * (1 - t * t * (3 - 2 * t));
             }
-            pix[i] = color[0] * light * (1 - dark);
-            pix[i + 1] = color[1] * light * (1 - dark * 0.9);
-            pix[i + 2] = color[2] * light * (1 - dark * 0.72);
+            let shine = 0;
+            if (glint > 0 && color[2] > color[0] + 8 && color[2] >= color[1]) {
+              const d = wx * hx + wy * hy + wz * hz;
+              if (d > 0.9) {
+                const d2 = d * d;
+                const d8 = d2 * d2 * d2 * d2;
+                shine = d8 * d8 * d8 * d8 * glint * 120;
+              }
+            }
+            pix[i] = color[0] * light * (1 - dark) + shine;
+            pix[i + 1] = color[1] * light * (1 - dark * 0.9) + shine;
+            pix[i + 2] = color[2] * light * (1 - dark * 0.72) + shine * 0.9;
             pix[i + 3] = 255;
           }
         }
@@ -638,6 +672,31 @@ function GlobeViewInner({ signals, routes, selectedId, onSelect, jump }: Props) 
         ctx.stroke();
       }
 
+      const put = (lat: number, lng: number) => project(lat, lng, b, w / 2, h / 2, radius);
+      const gridAlpha = 0.09 * clamp(2.4 - view.zoom, 0, 1);
+      if (gridAlpha > 0.005) {
+        ctx.strokeStyle = `rgba(62,224,197,${gridAlpha.toFixed(3)})`;
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        const trace = (fn: (t: number) => { lat: number; lng: number }, steps: number) => {
+          let started = false;
+          for (let k = 0; k <= steps; k += 1) {
+            const at = fn(k / steps);
+            const p = put(at.lat, at.lng);
+            if (!p) {
+              started = false;
+              continue;
+            }
+            if (started) ctx.lineTo(p.x, p.y);
+            else ctx.moveTo(p.x, p.y);
+            started = true;
+          }
+        };
+        for (let lng = -180; lng < 180; lng += 30) trace((t) => ({ lat: -80 + t * 160, lng }), 48);
+        for (let lat = -60; lat <= 60; lat += 30) trace((t) => ({ lat, lng: -180 + t * 360 }), 120);
+        ctx.stroke();
+      }
+
       const wall = Date.now();
       const moving = new Map<string, { lat: number; lng: number }>();
       const legs = new Map<string, { heading: number }>();
@@ -670,13 +729,42 @@ function GlobeViewInner({ signals, routes, selectedId, onSelect, jump }: Props) 
           name: signal.name,
           common: signal.common,
           heading: legs.get(signal.id)?.heading ?? null,
-          fresh: Date.now() - Date.parse(signal.observedAt) < 120 * 86_400_000,
+          fresh: wall - Date.parse(signal.observedAt) < 120 * 86_400_000,
+          hot: signal.kind === "tag" && wall - Date.parse(signal.observedAt) < 48 * 3_600_000,
+          phase: phaseFor(signal.id),
         };
       });
       dots.sort((a, b) => Number(a.kind === "tag") - Number(b.kind === "tag"));
       const focus = routesRef.current.find((route) => route.id === selectedRef.current)?.points ?? null;
       const hits: Hit[] = [];
-      const put = (lat: number, lng: number) => project(lat, lng, b, w / 2, h / 2, radius);
+
+      // Fading wakes behind every recently moving tag: the last few weeks of pings.
+      ctx.lineWidth = 1.4;
+      ctx.lineCap = "round";
+      for (const route of routesRef.current) {
+        if (route.id === selectedRef.current || route.points.length < 2) continue;
+        const last = route.points[route.points.length - 1];
+        const lastAt = Date.parse(last.at);
+        if (!Number.isFinite(lastAt) || wall - lastAt > 120 * 86_400_000) continue;
+        const tail = route.points.filter((point) => lastAt - Date.parse(point.at) <= 30 * 86_400_000).slice(-16);
+        const head = shown.get(route.id);
+        const path = head ? [...tail, { ...head, at: last.at }] : tail;
+        if (path.length < 2) continue;
+        ctx.strokeStyle = COLORS[route.group];
+        let prev = put(path[0].lat, path[0].lng);
+        for (let k = 1; k < path.length; k += 1) {
+          const next = put(path[k].lat, path[k].lng);
+          if (prev && next) {
+            ctx.globalAlpha = 0.08 + 0.5 * (k / (path.length - 1));
+            ctx.beginPath();
+            ctx.moveTo(prev.x, prev.y);
+            ctx.lineTo(next.x, next.y);
+            ctx.stroke();
+          }
+          prev = next;
+        }
+      }
+      ctx.globalAlpha = 1;
 
       if (focus && focus.length > 1) {
         ctx.beginPath();
@@ -712,6 +800,16 @@ function GlobeViewInner({ signals, routes, selectedId, onSelect, jump }: Props) 
           ctx.globalAlpha = 0.32;
           ctx.arc(p.x, p.y, size * 2.2, 0, Math.PI * 2);
           ctx.fill();
+        }
+        if (dot.hot && !reduced) {
+          // A sonar ping for tags that surfaced in the last 48 hours.
+          const t = (now / 2400 + dot.phase) % 1;
+          ctx.beginPath();
+          ctx.strokeStyle = COLORS[dot.group];
+          ctx.lineWidth = 1.5;
+          ctx.globalAlpha = 0.7 * (1 - t);
+          ctx.arc(p.x, p.y, size * (1.4 + 3.2 * t), 0, Math.PI * 2);
+          ctx.stroke();
         }
         ctx.globalAlpha = quiet ? 0.45 : sighting ? 0.62 : 1;
         ctx.beginPath();
