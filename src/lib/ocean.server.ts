@@ -1,4 +1,5 @@
 import type { Feed, Group, LiveRoute, Signal, SourceStatus, Track, TrackPoint } from "./ocean.types";
+import { loadAcoustic } from "./whoi.server";
 
 const UA = "FinScape/1.0 (educational live ocean map)";
 const MAP_ID = 3413;
@@ -145,6 +146,7 @@ export function loadSignals(fresh = false): Promise<Feed> {
             count: 0,
             note,
           },
+          { id: "whoi", label: "WHOI whale-listening buoys", ok: false, count: 0, note },
         ],
       };
       return empty;
@@ -166,14 +168,14 @@ export async function loadTrack(tagId: number): Promise<Track> {
 
 async function buildFeed(): Promise<Feed> {
   const since = new Date(Date.now() - 400 * 86_400_000).toISOString().slice(0, 10);
-  const [tags, sightings] = await Promise.all([fetchOcearch(), loadSightings(since)]);
-  const signals = [...tags.signals, ...sightings.signals].sort((a, b) =>
+  const [tags, sightings, heard] = await Promise.all([fetchOcearch(), loadSightings(since), loadAcoustic()]);
+  const signals = [...tags.signals, ...sightings.signals, ...heard.signals].sort((a, b) =>
     a.observedAt < b.observedAt ? 1 : -1,
   );
   return {
     fetchedAt: new Date().toISOString(),
     signals,
-    sources: [tags.status, sightings.status],
+    sources: [tags.status, sightings.status, heard.status],
   };
 }
 
@@ -287,6 +289,7 @@ function ocearchFeature(feature: unknown): Signal | null {
     url: slug ? `https://www.ocearch.org/tracker/detail/${slug}` : "https://www.ocearch.org/tracker/",
     tagId: id,
     credit: "OCEARCH",
+    note: null,
   };
 }
 
@@ -485,6 +488,7 @@ function inatObservation(group: Group, value: unknown): Signal | null {
     url: str(row.uri) ?? `https://www.inaturalist.org/observations/${id}`,
     tagId: null,
     credit: login ? `@${login} on iNaturalist` : "iNaturalist",
+    note: null,
   };
 }
 

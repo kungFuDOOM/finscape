@@ -715,7 +715,7 @@ const ListPane = memo(function ListPane({
                       <span className="flex items-baseline justify-between gap-2">
                         <span className="truncate font-display text-base text-fg">{signal.name}</span>
                         <span className="shrink-0 font-mono text-xs text-muted">
-                          {signal.kind === "tag" ? "TAG" : "SEEN"}
+                          {signal.kind === "tag" ? "TAG" : signal.source === "whoi" ? "HEARD" : "SEEN"}
                         </span>
                       </span>
                       <span className="block truncate font-mono text-xs text-muted">
@@ -842,7 +842,8 @@ function Dossier({
       <div className="space-y-3 px-4 py-3">
         <div>
           <p className="font-mono text-xs uppercase tracking-widest text-muted">
-            {signal.group} · {signal.kind === "tag" ? "satellite tag" : "sighting"}
+            {signal.group} ·{" "}
+            {signal.kind === "tag" ? "satellite tag" : signal.source === "whoi" ? "acoustic detection" : "sighting"}
           </p>
           <h2 className="mt-1 font-display text-3xl leading-none text-fg">{signal.name}</h2>
           <p className="mt-2 font-mono text-sm text-muted">
@@ -861,6 +862,7 @@ function Dossier({
           {signal.length ? <Fact label="Length" value={signal.length} /> : null}
           {signal.weight ? <Fact label="Weight" value={signal.weight} /> : null}
           {signal.stage ? <Fact label="Life stage" value={signal.stage} /> : null}
+          {signal.note ? <Fact label="Confidence" value={signal.note.split(" · ")[0]} /> : null}
           {signal.credit ? <Fact label={signal.kind === "tag" ? "Tagged by" : "Observed by"} value={signal.credit} /> : null}
           {signal.place ? <Fact label={signal.kind === "tag" ? "Tagged" : "Place"} value={signal.place} /> : null}
         </dl>
@@ -873,7 +875,9 @@ function Dossier({
                 : track?.error
                   ? track.error
                   : "No stored path for this tag."
-            : "A sighting, not a tag. It stays where it was recorded."}
+            : signal.source === "whoi"
+              ? `Heard, not seen: an underwater microphone picked up calls in ${signal.note?.split(" · ")[1] ?? "at least one period that day"}. The marker sits at the listening platform; the whale was within earshot.`
+              : "A sighting, not a tag. It stays where it was recorded."}
         </p>
         {signal.url ? (
           <a
@@ -882,7 +886,11 @@ function Dossier({
             rel="noreferrer"
             className="inline-flex min-h-11 items-center font-mono text-xs text-phosphor"
           >
-            {signal.source === "ocearch" ? "Open on OCEARCH" : "Open on iNaturalist"}
+            {signal.source === "ocearch"
+              ? "Open on OCEARCH"
+              : signal.source === "whoi"
+                ? "Open the buoy's daily log"
+                : "Open on iNaturalist"}
           </a>
         ) : null}
       </div>

@@ -27,6 +27,7 @@ type Dot = {
   heading: number | null;
   fresh: boolean;
   hot: boolean;
+  heard: boolean;
   phase: number;
 };
 type Hit = { id: string; x: number; y: number };
@@ -731,6 +732,7 @@ function GlobeViewInner({ signals, routes, selectedId, onSelect, jump }: Props) 
           heading: legs.get(signal.id)?.heading ?? null,
           fresh: wall - Date.parse(signal.observedAt) < 120 * 86_400_000,
           hot: signal.kind === "tag" && wall - Date.parse(signal.observedAt) < 48 * 3_600_000,
+          heard: signal.source === "whoi",
           phase: phaseFor(signal.id),
         };
       });
@@ -789,6 +791,38 @@ function GlobeViewInner({ signals, routes, selectedId, onSelect, jump }: Props) 
       for (const dot of dots) {
         const p = put(dot.lat, dot.lng);
         if (!p || p.x < -24 || p.y < -24 || p.x > w + 24 || p.y > h + 24) continue;
+        if (dot.heard) {
+          // Acoustic detections: a listening ring with sound waves rolling out from it.
+          const r = (dot.id === selectedRef.current ? 6 : 4) * dotScale;
+          ctx.strokeStyle = COLORS[dot.group];
+          ctx.lineWidth = 1.6;
+          ctx.globalAlpha = 0.95;
+          ctx.beginPath();
+          ctx.arc(p.x, p.y, r, 0, Math.PI * 2);
+          ctx.stroke();
+          ctx.fillStyle = COLORS[dot.group];
+          ctx.beginPath();
+          ctx.arc(p.x, p.y, r * 0.4, 0, Math.PI * 2);
+          ctx.fill();
+          const waves = reduced ? [0.5] : [0, 0.5];
+          for (const offset of waves) {
+            const t = reduced ? offset : (now / 3000 + dot.phase + offset) % 1;
+            ctx.globalAlpha = 0.55 * (1 - t);
+            ctx.beginPath();
+            ctx.arc(p.x, p.y, r * (1.6 + 2.6 * t), 0, Math.PI * 2);
+            ctx.stroke();
+          }
+          ctx.globalAlpha = 1;
+          if (dot.id === selectedRef.current) {
+            ctx.beginPath();
+            ctx.strokeStyle = "#f4fff8";
+            ctx.lineWidth = 1.5;
+            ctx.arc(p.x, p.y, r + 6, 0, Math.PI * 2);
+            ctx.stroke();
+          }
+          hits.push({ id: dot.id, x: p.x, y: p.y });
+          continue;
+        }
         const sighting = dot.kind === "sighting";
         const quiet = dot.kind === "tag" && !dot.fresh;
         const size =
@@ -867,7 +901,7 @@ function GlobeViewInner({ signals, routes, selectedId, onSelect, jump }: Props) 
         const p = put(hovered.lat, hovered.lng);
         if (p) {
           const title = hovered.name.length > 28 ? `${hovered.name.slice(0, 27)}…` : hovered.name;
-          const sub = `${hovered.kind === "tag" ? "Tag" : "Sighting"} · ${hovered.common}`;
+          const sub = `${hovered.kind === "tag" ? "Tag" : hovered.heard ? "Heard" : "Sighting"} · ${hovered.common}`;
           const line2 = sub.length > 34 ? `${sub.slice(0, 33)}…` : sub;
           ctx.font = "600 13px IBM Plex Mono, ui-monospace, monospace";
           const tw1 = ctx.measureText(title).width;

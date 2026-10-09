@@ -1,6 +1,6 @@
 export type Group = "whale" | "shark" | "dolphin" | "turtle" | "seal";
 export type Kind = "tag" | "sighting";
-export type SourceId = "ocearch" | "inaturalist";
+export type SourceId = "ocearch" | "inaturalist" | "whoi";
 
 export type Signal = {
   id: string;
@@ -23,6 +23,8 @@ export type Signal = {
   tagId: number | null;
   /** Who recorded it: the tagging program or the iNaturalist observer. */
   credit: string | null;
+  /** Extra context, e.g. how confident an acoustic detection is. */
+  note: string | null;
 };
 
 export type SourceStatus = {
