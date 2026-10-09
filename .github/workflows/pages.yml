@@ -4,7 +4,7 @@ name: Publish to GitHub Pages
 # GitHub may run scheduled jobs late when it is busy.
 on:
   push:
-    branches: [main, claude/finscape-improvements]
+    branches: [main]
   schedule:
     - cron: "*/15 * * * *"
   workflow_dispatch:
