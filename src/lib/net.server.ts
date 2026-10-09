@@ -68,3 +68,17 @@ export async function pool<T, R>(
   await Promise.all(Array.from({ length: workers }, () => worker()));
   return out;
 }
+
+/** Retries a flaky upstream call with a short, growing pause; the last error is rethrown. */
+export async function retry<T>(attempts: number, fn: () => Promise<T>): Promise<T> {
+  let last: unknown;
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      return await fn();
+    } catch (error) {
+      last = error;
+      if (attempt < attempts) await new Promise((done) => setTimeout(done, 1_500 * attempt));
+    }
+  }
+  throw last;
+}

@@ -1,7 +1,7 @@
 import { loadAcartia } from "./acartia.server";
 import { loadGhri } from "./ghri.server";
 import { downsample, MAPOTIC, motionPoints, readTrack, trackUrl } from "./motion";
-import { asRecord, byNewest, fetchJson, num, pool, str } from "./net.server";
+import { asRecord, byNewest, fetchJson, num, pool, retry, str } from "./net.server";
 import type {
   Feed,
   Group,
@@ -350,12 +350,13 @@ async function fetchInat(since: string): Promise<InatResult> {
   let failed = 0;
   const seen = new Set<string>();
   const signals: Signal[] = [];
-  const rows = await pool(jobs, 8, async (job) => {
+  // iNaturalist asks for about one request a second; four at a time with retries stays polite.
+  const rows = await pool(jobs, 4, async (job) => {
     const taxa = TAXA.find((item) => item.group === job.group);
     const box = THEATERS.find((item) => item[0] === job.theater);
     if (!taxa || !box) return [];
     try {
-      return await fetchInatBox(taxa.group, taxa.taxon, box, since);
+      return await retry(2, () => fetchInatBox(taxa.group, taxa.taxon, box, since));
     } catch {
       failed += 1;
       return [];
@@ -402,7 +403,7 @@ async function fetchInatBox(
     fields:
       "id,species_guess,location,observed_on,time_observed_at,place_guess,uri,obscured,geoprivacy,taxon.name,taxon.preferred_common_name",
   });
-  const data = await fetchJson(`https://api.inaturalist.org/v2/observations?${params}`, 12_000);
+  const data = await fetchJson(`https://api.inaturalist.org/v2/observations?${params}`, 20_000);
   const root = asRecord(data);
   const results = Array.isArray(root?.results) ? root.results : [];
   const signals: Signal[] = [];

@@ -1,4 +1,4 @@
-import { asRecord, downsample, num, pool, str } from "./net.server";
+import { asRecord, downsample, num, pool, retry, str } from "./net.server";
 import type { LiveRoute, Signal, SourceStatus, TrackPoint } from "./ocean.types";
 
 /**
@@ -106,7 +106,7 @@ export function loadWhaleTags(): Promise<WhaleTags> {
 
 async function readMap(id: string): Promise<unknown[]> {
   const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), 25_000);
+  const timer = setTimeout(() => ctrl.abort(), 45_000);
   try {
     const res = await fetch(ENDPOINT, {
       method: "POST",
@@ -136,11 +136,13 @@ async function buildWhaleTags(): Promise<WhaleTags> {
     note: null,
   };
   let failed = 0;
-  const maps = await pool(PROJECTS, 4, async (project) => {
+  let reason = "";
+  const maps = await pool(PROJECTS, 3, async (project) => {
     try {
-      return { project, deployments: await readMap(project.map) };
-    } catch {
+      return { project, deployments: await retry(3, () => readMap(project.map)) };
+    } catch (error) {
       failed += 1;
+      reason ||= error instanceof Error ? error.message : String(error);
       return { project, deployments: [] as unknown[] };
     }
   });
@@ -162,7 +164,7 @@ async function buildWhaleTags(): Promise<WhaleTags> {
   status.ok = signals.length > 0;
   status.count = signals.length;
   status.note = signals.length
-    ? `Southern right and sei whales tagged off Argentina, the Falklands and New Zealand; ${live} uplinked in the last 2 days${failed ? `, ${failed} maps unreachable` : ""}. Argos fixes can be off by several km.`
+    ? `Southern right and sei whales tagged off Argentina, the Falklands and New Zealand; ${live} uplinked in the last 2 days${failed ? `, ${failed} maps unreachable (${reason})` : ""}. Argos fixes can be off by several km.`
     : "The tag maps did not answer.";
   return { signals, routes, status };
 }
