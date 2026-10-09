@@ -118,8 +118,8 @@ export function PelagosApp({
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [groups, setGroups] = useState<Record<Group, boolean>>(ALL_GROUPS);
-  const [windowKey, setWindowKey] = useState<WindowKey>("all");
-  const [kind, setKind] = useState<Kind | "all">("tag");
+  const [windowKey, setWindowKey] = useState<WindowKey>("90d");
+  const [kind, setKind] = useState<Kind | "all">("all");
   const [query, setQuery] = useState("");
   const [menuOpen, setMenuOpen] = useState(false);
   const [selectedId, setSelectedId] = useState<string | null>(focusId);
