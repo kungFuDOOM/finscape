@@ -1,6 +1,6 @@
 export type Group = "whale" | "shark" | "dolphin";
 export type Kind = "tag" | "heard" | "sighting";
-export type SourceId = "ocearch" | "whoi" | "inaturalist";
+export type SourceId = "ocearch" | "wildlife" | "whoi" | "inaturalist";
 
 export type CallStatus = "detected" | "possible" | "none";
 

@@ -42,6 +42,7 @@ const KIND_ORDER: Record<Kind, number> = { heard: 0, tag: 1, sighting: 2 };
 
 const SOURCE_LINK: Record<SourceId, string> = {
   ocearch: "Open on OCEARCH",
+  wildlife: "Open the tracking project",
   whoi: "Open the WHOI platform page",
   inaturalist: "Open on iNaturalist",
 };
@@ -49,6 +50,7 @@ const SOURCE_LINK: Record<SourceId, string> = {
 const DAY_MS = 86_400_000;
 
 const OCEANS = [
+  { id: "patagonia", label: "Patagonia", lat: -44, lng: -58, zoom: 2.1 },
   { id: "california", label: "California", lat: 34.5, lng: -121, zoom: 2.3 },
   { id: "atlantic", label: "Atlantic", lat: 38, lng: -60, zoom: 1.55 },
   { id: "gulf", label: "Gulf", lat: 26, lng: -86, zoom: 2 },
@@ -411,9 +413,9 @@ export function PelagosApp() {
         <aside className="lock-card hud-panel">
           <Dossier
             signal={selected}
-            points={track?.points ?? []}
+            points={selected.tagId ? (track?.points ?? []) : (selectedRoute?.points ?? [])}
             trackError={track?.error ?? null}
-            trackState={trackState}
+            trackState={selected.tagId ? trackState : "ready"}
             moving={Boolean(selectedRoute)}
             now={now}
             onRelease={() => setSelectedId(null)}
@@ -755,6 +757,10 @@ function Dossier({
 }) {
   const km = points.length > 1 ? Math.round(pathKm(points)) : null;
   const leg = trackLeg(points);
+  const spanDays =
+    points.length > 1
+      ? Math.max(1, Math.round((Date.parse(points[points.length - 1].at) - Date.parse(points[0].at)) / DAY_MS))
+      : null;
   const groupLabel = GROUPS.find((group) => group.id === signal.group)?.label ?? signal.group;
   const kindLabel =
     signal.kind === "heard"
@@ -793,6 +799,9 @@ function Dossier({
           />
           {leg ? <Fact label="Course" value={pace(leg)} /> : null}
           {leg ? <Fact label="Heading" value={`${Math.round(leg.heading)}°`} /> : null}
+          {signal.kind === "tag" && spanDays !== null ? (
+            <Fact label="Tracked for" value={`${spanDays.toLocaleString("en-US")} days`} />
+          ) : null}
           <Fact label="Latitude" value={signal.lat.toFixed(3)} />
           <Fact label="Longitude" value={signal.lng.toFixed(3)} />
           {signal.sex ? <Fact label="Sex" value={signal.sex} /> : null}
@@ -802,9 +811,11 @@ function Dossier({
               label={
                 signal.kind === "heard"
                   ? "Operator"
-                  : signal.kind === "tag"
-                    ? "Tagged"
-                    : "Place"
+                  : signal.source === "wildlife"
+                    ? "Project"
+                    : signal.kind === "tag"
+                      ? "Tagged"
+                      : "Place"
               }
               value={signal.place}
             />
@@ -818,7 +829,7 @@ function Dossier({
               : trackState === "loading"
                   ? "Pulling the ping history…"
                   : moving
-                    ? `${points.length || "Recorded"} pings${km !== null ? ` · ${km.toLocaleString("en-US")} km` : ""}. The dot follows the latest pings.`
+                    ? `${km !== null ? `About ${km.toLocaleString("en-US")} km along the plotted path. ` : ""}The dot follows the latest pings.`
                     : (trackError ?? "No stored path for this tag.")}
         </p>
         {signal.url ? (

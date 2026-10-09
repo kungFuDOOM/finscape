@@ -1,6 +1,7 @@
 import { asRecord, byNewest, downsample, fetchJson, num, pool, str } from "./net.server";
 import type { Feed, Group, LiveRoute, Signal, SourceStatus, Track, TrackPoint } from "./ocean.types";
 import { loadWhoi } from "./whoi.server";
+import { loadWhaleTags, type WhaleTags } from "./wildlife.server";
 
 const MAP_ID = 3413;
 const MAPOTIC = `https://www.mapotic.com/api/v1/maps/${MAP_ID}`;
@@ -63,7 +64,9 @@ async function buildLiveRoutes(): Promise<LiveRoute[]> {
     olderRoutes = await fetchMotionRoutes(older);
     archiveRoutes = { at: Date.now(), data: olderRoutes };
   }
+  const whales = await loadWhaleTags().catch(() => null);
   const byId = new Map<string, LiveRoute>();
+  for (const route of whales?.routes ?? []) byId.set(route.id, route);
   for (const route of olderRoutes) byId.set(route.id, route);
   for (const route of recentRoutes) byId.set(route.id, route);
   return [...byId.values()];
@@ -129,6 +132,7 @@ export function loadSignals(fresh = false): Promise<Feed> {
         signals: [],
         sources: [
           { id: "ocearch", label: "OCEARCH satellite tags", ok: false, count: 0, note },
+          { id: "wildlife", label: "Whale satellite tags (Wildlife Computers)", ok: false, count: 0, note },
           { id: "whoi", label: "WHOI Robots4Whales listening platforms", ok: false, count: 0, note },
           {
             id: "inaturalist",
@@ -158,8 +162,21 @@ export async function loadTrack(tagId: number): Promise<Track> {
 
 async function buildFeed(): Promise<Feed> {
   const since = new Date(Date.now() - 400 * 86_400_000).toISOString().slice(0, 10);
-  const [tags, sightings, heard] = await Promise.all([
+  const [tags, whales, sightings, heard] = await Promise.all([
     fetchOcearch(),
+    loadWhaleTags().catch(
+      (error: unknown): WhaleTags => ({
+        signals: [],
+        routes: [],
+        status: {
+          id: "wildlife",
+          label: "Whale satellite tags (Wildlife Computers)",
+          ok: false,
+          count: 0,
+          note: error instanceof Error ? error.message : "Tag maps unreachable",
+        },
+      }),
+    ),
     fetchInat(since),
     loadWhoi().catch((error: unknown) => ({
       signals: [] as Signal[],
@@ -172,11 +189,11 @@ async function buildFeed(): Promise<Feed> {
       } satisfies SourceStatus,
     })),
   ]);
-  const signals = [...tags.signals, ...heard.signals, ...sightings.signals].sort(byNewest);
+  const signals = [...tags.signals, ...whales.signals, ...heard.signals, ...sightings.signals].sort(byNewest);
   return {
     fetchedAt: new Date().toISOString(),
     signals,
-    sources: [tags.status, heard.status, sightings.status],
+    sources: [tags.status, whales.status, heard.status, sightings.status],
   };
 }
 
