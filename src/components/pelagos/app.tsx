@@ -14,7 +14,8 @@ import type {
   Track,
   TrackPoint,
 } from "@/lib/ocean.types";
-import { GlobeView, trackLeg } from "./globe";
+import { trackLeg } from "@/lib/geo";
+import { GlobeView } from "./globe";
 
 type WindowKey = "48h" | "30d" | "90d" | "all";
 
@@ -183,6 +184,22 @@ export function PelagosApp({
   const jumpN = useRef(0);
   const menuRef = useRef<HTMLDivElement | null>(null);
   const searchRef = useRef<HTMLInputElement | null>(null);
+  const [intro, setIntro] = useState(false);
+  useEffect(() => {
+    try {
+      setIntro(!focusId && window.localStorage.getItem("finscape:intro") !== "seen");
+    } catch {
+      setIntro(!focusId);
+    }
+  }, [focusId]);
+  const closeIntro = useCallback(() => {
+    setIntro(false);
+    try {
+      window.localStorage.setItem("finscape:intro", "seen");
+    } catch {
+      /* private mode: the intro just shows again next visit */
+    }
+  }, []);
 
   const load = useCallback(async (fresh: boolean) => {
     try {
@@ -262,32 +279,36 @@ export function PelagosApp({
     return () => window.removeEventListener("keydown", onKey);
   }, [menuOpen]);
 
-  const visible = useMemo(() => {
-    const signals = thinSightings(feed?.signals ?? []);
+  // Thinning near-duplicate sightings is quadratic; do it once per feed, not per filter tap.
+  const thinned = useMemo(() => thinSightings(feed?.signals ?? []), [feed]);
+
+  const windowed = useMemo(() => {
     const span = WINDOWS.find((item) => item.id === windowKey)?.ms ?? null;
+    if (span === null) return thinned;
     const parsed = Date.parse(feed?.fetchedAt ?? "");
     const stamp = now ?? (Number.isFinite(parsed) ? parsed : Date.now());
-    return signals.filter((signal) => {
-      if (!groups[signal.group]) return false;
-      if (!layers[signal.kind]) return false;
-      if (span !== null) {
-        const at = Date.parse(signal.observedAt);
-        if (!Number.isFinite(at) || stamp - at > span) return false;
-      }
-      return true;
+    return thinned.filter((signal) => {
+      const at = Date.parse(signal.observedAt);
+      return Number.isFinite(at) && stamp - at <= span;
     });
-  }, [feed, groups, windowKey, layers, now]);
+  }, [thinned, feed, windowKey, now]);
 
+  const visible = useMemo(
+    () => windowed.filter((signal) => groups[signal.group] && layers[signal.kind]),
+    [windowed, groups, layers],
+  );
+
+  /** Counts for the species chips: before the chip filters, so a hidden species keeps its number. */
   const counts = useMemo(() => {
     // Hydrophones count on their own: ten buoys are not ten whales.
     const tally: Record<Group, number> = { whale: 0, shark: 0, dolphin: 0 };
     let heard = 0;
-    for (const signal of visible) {
+    for (const signal of windowed) {
       if (signal.kind === "heard") heard += 1;
-      else tally[signal.group] += 1;
+      else if (layers[signal.kind]) tally[signal.group] += 1;
     }
     return { ...tally, heard };
-  }, [visible]);
+  }, [windowed, layers]);
 
   /** Newest live events across every source, regardless of the layer toggles. */
   const pulse = useMemo(() => {
@@ -438,25 +459,18 @@ export function PelagosApp({
                 type="button"
                 className="signal-toggle hud-panel inline-flex min-h-11 items-center gap-2 px-4 font-mono text-sm text-fg"
                 aria-expanded={menuOpen}
+                aria-label="Search and filter animals"
                 onClick={() => setMenuOpen((open) => !open)}
               >
-                Signals
+                <Search className="size-4 text-phosphor" aria-hidden="true" />
+                <span className="signal-label">Search</span>
                 {feed ? (
                   <span className="rounded-full bg-surface-2 px-2 py-0.5 text-xs text-muted tabular-nums">
                     {visible.length}
                   </span>
                 ) : null}
-                <ChevronDown className={`size-4 text-phosphor ${menuOpen ? "rotate-180" : ""}`} />
+                <ChevronDown className={`size-4 text-muted ${menuOpen ? "rotate-180" : ""}`} />
               </button>
-            </div>
-            <div className="pointer-events-none flex shrink-0 items-start gap-2">
-              <div className="hud-panel hidden items-center gap-4 px-4 py-3 lg:flex">
-                {GROUPS.map((group) => (
-                  <Count key={group.id} n={counts[group.id]} label={group.count} />
-                ))}
-                {layers.heard ? <Count n={counts.heard} label="hydrophones" /> : null}
-              </div>
-              <Clock />
             </div>
           </div>
           <div className="oceans" role="group" aria-label="Jump to an ocean">
@@ -471,6 +485,25 @@ export function PelagosApp({
               </button>
             ))}
           </div>
+          {intro && !menuOpen && !selected ? (
+            <div className="intro hud-panel" role="note">
+              <p className="font-display text-lg leading-tight text-fg">Ocean life, live.</p>
+              <p className="mt-1 text-muted">
+                <span className="intro-key">
+                  <i className="size-2.5 rounded-full bg-shark" /> Glowing dots
+                </span>{" "}
+                are satellite-tagged sharks and whales,{" "}
+                <span className="intro-key">
+                  <i className="heard-ring" /> rings
+                </span>{" "}
+                are underwater microphones hearing whale calls, and small dots are recent sightings.
+                Tap anything to follow it.
+              </p>
+              <button type="button" className="intro-close" onClick={closeIntro}>
+                Got it
+              </button>
+            </div>
+          ) : null}
           {menuOpen ? (
             <div className="menu-drop hud-panel">
               <ListPane
@@ -500,7 +533,7 @@ export function PelagosApp({
         </div>
       </header>
 
-      {selected ? (
+      {menuOpen && !selected ? null : selected ? (
         <aside className="lock-card hud-panel">
           <Dossier
             signal={selected}
@@ -515,66 +548,51 @@ export function PelagosApp({
         </aside>
       ) : (
         <div className="dock">
-          <Pulse items={pulse} now={now} onSelect={choose} />
-          <div className="dock-row">
-            <Layers
-              layers={layers}
-              onLayer={(id) => setLayers((prev) => ({ ...prev, [id]: !prev[id] }))}
-            />
+          {loading || feedsDown ? (
+            <p className={`pulse hud-panel ${feedsDown ? "text-shark" : "text-muted"}`}>
+              {feedsDown ? "Tracking feeds unreachable · retrying" : "Sweeping the basins…"}
+            </p>
+          ) : (
+            <Pulse items={pulse} now={now} onSelect={choose} />
+          )}
+          {/* The legend is the filter: tap a species to hide or show it. */}
+          <div className="species hud-panel" role="group" aria-label="Show species">
+            {GROUPS.map((group) => (
+              <button
+                key={group.id}
+                type="button"
+                aria-pressed={groups[group.id]}
+                onClick={() => setGroups((prev) => ({ ...prev, [group.id]: !prev[group.id] }))}
+              >
+                <i className={`size-2.5 rounded-full ${pipClass(group.id)}`} aria-hidden="true" />
+                <span>{group.label}</span>
+                <span className="species-count tabular-nums">{counts[group.id]}</span>
+              </button>
+            ))}
             <button
               type="button"
-              className="surprise hud-panel"
+              aria-pressed={layers.heard}
+              onClick={() => setLayers((prev) => ({ ...prev, heard: !prev.heard }))}
+              aria-label={`Hydrophones listening for whales: ${summary.hearing} hearing calls`}
+              title="Hydrophones listening for whales"
+            >
+              <i className="heard-ring" aria-hidden="true" />
+              <span className="species-count tabular-nums">{counts.heard}</span>
+            </button>
+            <button
+              type="button"
+              className="species-dice"
               onClick={surprise}
               disabled={!feed?.signals.some((signal) => signal.kind === "tag")}
               aria-label="Fly to a random tagged animal"
+              title="Random animal"
             >
               <Dices className="size-4" aria-hidden="true" />
-              <span>Random</span>
             </button>
-          </div>
-          <div className="legend hud-panel pointer-events-none px-3 py-2 font-mono text-xs text-fg">
-            {GROUPS.map((group) => (
-              <span key={group.id} className="inline-flex items-center gap-1">
-                <i className={`size-2.5 rounded-full ${pipClass(group.id)}`} /> {group.label}
-              </span>
-            ))}
-            <span className="inline-flex items-center gap-1">
-              <i className="heard-ring" /> Hydrophone
-            </span>
-            <span className={feedsDown ? "text-shark" : "text-muted"}>
-              {loading
-                ? "Sweeping the basins…"
-                : feedsDown
-                  ? "Feeds unreachable · retrying"
-                  : `${summary.pinged} tags pinged this week · ${summary.hearing} hydrophones hearing whales`}
-            </span>
           </div>
         </div>
       )}
     </main>
-  );
-}
-
-function Layers({
-  layers,
-  onLayer,
-}: {
-  layers: Record<Kind, boolean>;
-  onLayer: (id: Kind) => void;
-}) {
-  return (
-    <div className="layer-switch hud-panel" role="group" aria-label="Map layers">
-      {LAYERS.map((item) => (
-        <button
-          key={item.id}
-          type="button"
-          aria-pressed={layers[item.id]}
-          onClick={() => onLayer(item.id)}
-        >
-          {item.label}
-        </button>
-      ))}
-    </div>
   );
 }
 
@@ -639,31 +657,6 @@ function thinSightings(signals: Signal[]): Signal[] {
     kept.push(signal);
   }
   return kept;
-}
-
-function Count({ n, label }: { n: number; label: string }) {
-  return (
-    <p className="text-center">
-      <span className="block font-mono text-lg leading-none text-fg tabular-nums">{n}</span>
-      <span className="mt-1 block font-mono text-xs text-muted">{label}</span>
-    </p>
-  );
-}
-
-function Clock() {
-  const [label, setLabel] = useState<string | null>(null);
-  useEffect(() => {
-    const tick = () => setLabel(new Date().toISOString().slice(11, 19));
-    tick();
-    const timer = window.setInterval(tick, 1000);
-    return () => window.clearInterval(timer);
-  }, []);
-  return (
-    <p className="clock-chip hud-panel px-3 py-2 font-mono text-xs text-muted tabular-nums">
-      <span>{label ?? "——:——:——"}</span>
-      <span className="clock-zone"> UTC</span>
-    </p>
-  );
 }
 
 const ListPane = memo(function ListPane({
@@ -960,7 +953,7 @@ function Dossier({
   return (
     <div>
       <div className="sticky top-0 z-10 flex items-center justify-between gap-1 border-b border-line bg-surface px-3 py-1">
-        <p className="font-mono text-xs tracking-widest text-phosphor">LOCK</p>
+        <p className="font-mono text-xs tracking-widest text-phosphor">FOLLOWING</p>
         <div className="flex items-center">
           <button
             type="button"
