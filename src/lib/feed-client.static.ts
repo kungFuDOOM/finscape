@@ -38,6 +38,6 @@ export async function loadTrack(id: number): Promise<Track> {
   }
 }
 
-export function tileUrl(z: number, y: number, x: number): string {
-  return `https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/${z}/${y}/${x}`;
+export function tileTemplate(): string {
+  return "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}";
 }

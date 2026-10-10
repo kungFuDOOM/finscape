@@ -18,7 +18,7 @@ export function loadTrack(id: number): Promise<Track> {
   return getTrack({ data: { id } });
 }
 
-/** Satellite tiles go through the app's own proxy route. */
-export function tileUrl(z: number, y: number, x: number): string {
-  return `/api/sat/${z}/${y}/${x}`;
+/** Esri World Imagery serves CORS-enabled tiles, so the WebGL globe loads them directly. */
+export function tileTemplate(): string {
+  return "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}";
 }

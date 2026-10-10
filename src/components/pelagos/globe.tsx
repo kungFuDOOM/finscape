@@ -1,7 +1,17 @@
-import { memo, useEffect, useRef } from "react";
+import { memo, useEffect, useRef, useState } from "react";
 import { Minus, Plus } from "lucide-react";
-import { tileUrl } from "@/lib/feed-client";
-import type { Group, LiveRoute, Signal, TrackPoint } from "@/lib/ocean.types";
+import type {
+  GeoJSONSource,
+  Map as MapLibreMap,
+  MapGeoJSONFeature,
+  Marker,
+  StyleSpecification,
+} from "maplibre-gl";
+import "maplibre-gl/dist/maplibre-gl.css";
+import { tileTemplate } from "@/lib/feed-client";
+import { clamp, liveFix, nightPolygon, trackLeg } from "@/lib/geo";
+import type { Feature, FeatureCollection } from "geojson";
+import type { Group, LiveRoute, Signal } from "@/lib/ocean.types";
 
 const COLORS: Record<Group, string> = {
   whale: "#3ee0c5",
@@ -9,48 +19,12 @@ const COLORS: Record<Group, string> = {
   dolphin: "#e2b15a",
 };
 
-const D2R = Math.PI / 180;
-const R2D = 180 / Math.PI;
-const ZOOM_MIN = 0;
-const ZOOM_MAX = 7.2;
+const LABELS = `https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}`;
+const DAY = 86_400_000;
+/** Tags that pinged within this window get a live marker; older ones are quiet dots. */
+const LIVE_MS = 30 * DAY;
 
-type Dot = {
-  id: string;
-  lat: number;
-  lng: number;
-  group: Group;
-  moving: boolean;
-  kind: Signal["kind"];
-  name: string;
-  common: string;
-  heading: number | null;
-  fresh: boolean;
-  /** Hydrophone platforms: whether analysts heard whales in the last few reviews. */
-  hearing: boolean;
-  hot: boolean;
-  phase: number;
-};
-type Hit = { id: string; x: number; y: number };
-type View = { zoom: number; lng: number; lat: number };
 type Jump = { id: number; lat: number; lng: number; zoom: number };
-type Basis = {
-  fx: number;
-  fy: number;
-  fz: number;
-  rx: number;
-  ry: number;
-  rz: number;
-  ux: number;
-  uy: number;
-  uz: number;
-};
-type TileEntry = {
-  img: HTMLImageElement;
-  ready: boolean;
-  pixels: Uint8ClampedArray | null;
-  w: number;
-  h: number;
-};
 
 type Props = {
   signals: Signal[];
@@ -60,1247 +34,500 @@ type Props = {
   jump: Jump | null;
 };
 
-function wrapLng(lng: number): number {
-  let value = lng;
-  while (value > 180) value -= 360;
-  while (value < -180) value += 360;
-  return value;
+type Entry = { marker: Marker; el: HTMLButtonElement; key: string };
+
+const EMPTY: FeatureCollection = { type: "FeatureCollection", features: [] };
+
+/** MapLibre zoom that shows the whole globe at ~40% of the shorter screen side. */
+function fitZoom(w: number, h: number): number {
+  return Math.log2((0.4 * Math.min(w, h)) / 81.5);
 }
 
-function clamp(n: number, min: number, max: number): number {
-  return Math.min(max, Math.max(min, n));
+/** The app's jump zooms were written for the old renderer (radius × 1.85^z); convert them. */
+function jumpZoom(base: number, legacy: number): number {
+  return base + legacy * Math.log2(1.85);
 }
 
-function deltaLng(from: number, to: number): number {
-  let d = to - from;
-  if (d > 180) d -= 360;
-  if (d < -180) d += 360;
-  return d;
+function isLive(signal: Signal, now: number): boolean {
+  if (signal.kind === "heard") return true;
+  return signal.kind === "tag" && now - Date.parse(signal.observedAt) < LIVE_MS;
 }
 
-function along(points: TrackPoint[], t: number): { lat: number; lng: number } {
-  if (points.length === 1) return points[0];
-  const scaled = t * (points.length - 1);
-  const index = Math.min(points.length - 2, Math.floor(scaled));
-  const mix = scaled - index;
-  const a = points[index];
-  const b = points[index + 1];
-  let dLng = b.lng - a.lng;
-  if (dLng > 180) dLng -= 360;
-  if (dLng < -180) dLng += 360;
-  return { lat: a.lat + (b.lat - a.lat) * mix, lng: wrapLng(a.lng + dLng * mix) };
+function groupColor(): unknown {
+  return ["match", ["get", "group"], "whale", COLORS.whale, "dolphin", COLORS.dolphin, COLORS.shark];
 }
 
-function kmBetween(a: { lat: number; lng: number }, b: { lat: number; lng: number }): number {
-  const dLat = (b.lat - a.lat) * 111;
-  const dLng = deltaLng(a.lng, b.lng) * 111 * Math.cos(((a.lat + b.lat) / 2) * D2R);
-  return Math.hypot(dLat, dLng);
+function setNight(map: MapLibreMap, now: number) {
+  const bands = [-9, -6, -3, 0, 3, 6, 9, 12].map((offset) => nightPolygon(now, offset));
+  (map.getSource("night") as GeoJSONSource | undefined)?.setData({
+    type: "FeatureCollection",
+    features: bands,
+  });
 }
 
-const COMPASS = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"] as const;
-
-export function trackLeg(points: TrackPoint[]): { kmh: number; heading: number; dir: string } | null {
-  if (points.length < 2) return null;
-  const a = points[points.length - 2];
-  const b = points[points.length - 1];
-  const hop = Date.parse(b.at) - Date.parse(a.at);
-  if (!Number.isFinite(hop) || hop < 60_000 || hop > 36 * 3_600_000) return null;
-  const km = kmBetween(a, b);
-  const kmh = km / (hop / 3_600_000);
-  if (km < 0.4 || kmh < 0.15 || kmh > 40) return null;
-  const dLng = deltaLng(a.lng, b.lng) * D2R;
-  const φ1 = a.lat * D2R;
-  const φ2 = b.lat * D2R;
-  const y = Math.sin(dLng) * Math.cos(φ2);
-  const x = Math.cos(φ1) * Math.sin(φ2) - Math.sin(φ1) * Math.cos(φ2) * Math.cos(dLng);
-  const heading = (Math.atan2(y, x) * R2D + 360) % 360;
-  return { kmh, heading, dir: COMPASS[Math.round(heading / 45) % 8] };
+function buildStyle(): StyleSpecification {
+  const wake = (group: Group) => ({
+    id: `wake-${group}`,
+    type: "line",
+    source: "wakes",
+    filter: ["==", ["get", "group"], group],
+    layout: { "line-cap": "round", "line-join": "round" },
+    paint: {
+      "line-width": ["interpolate", ["linear"], ["zoom"], 1, 1.2, 6, 2.6],
+      "line-gradient": ["interpolate", ["linear"], ["line-progress"], 0, "rgba(0,0,0,0)", 1, COLORS[group]],
+    },
+  });
+  const style = {
+    version: 8,
+    projection: { type: "globe" },
+    sky: {
+      "sky-color": "#071016",
+      "horizon-color": "#3ee0c5",
+      "fog-color": "#0d2a33",
+      "sky-horizon-blend": 0.6,
+      "horizon-fog-blend": 0.8,
+      "fog-ground-blend": 0.9,
+      "atmosphere-blend": ["interpolate", ["linear"], ["zoom"], 0, 1, 5, 1, 8, 0],
+    },
+    sources: {
+      imagery: {
+        type: "raster",
+        tiles: [tileTemplate()],
+        tileSize: 256,
+        maxzoom: 16,
+        attribution: "Imagery © Esri, Maxar, Earthstar Geographics",
+      },
+      labels: { type: "raster", tiles: [LABELS], tileSize: 256, maxzoom: 13 },
+      night: { type: "geojson", data: EMPTY },
+      wakes: { type: "geojson", data: EMPTY, lineMetrics: true },
+      focus: { type: "geojson", data: EMPTY },
+      sightings: { type: "geojson", data: EMPTY, cluster: true, clusterRadius: 34, clusterMaxZoom: 5 },
+      quiet: { type: "geojson", data: EMPTY },
+    },
+    layers: [
+      { id: "space", type: "background", paint: { "background-color": "#071016" } },
+      {
+        id: "imagery",
+        type: "raster",
+        source: "imagery",
+        paint: { "raster-saturation": -0.08, "raster-fade-duration": 200 },
+      },
+      {
+        // Eight overlapping bands, 3° apart, stack into a soft dusk gradient.
+        id: "night",
+        type: "fill",
+        source: "night",
+        paint: {
+          "fill-color": "#01060d",
+          "fill-opacity": ["interpolate", ["linear"], ["zoom"], 0, 0.085, 4, 0.05, 7, 0],
+          "fill-antialias": false,
+        },
+      },
+      {
+        id: "labels",
+        type: "raster",
+        source: "labels",
+        minzoom: 3.5,
+        paint: { "raster-opacity": ["interpolate", ["linear"], ["zoom"], 3.5, 0, 4.5, 0.85] },
+      },
+      wake("whale"),
+      wake("shark"),
+      wake("dolphin"),
+      {
+        id: "focus",
+        type: "line",
+        source: "focus",
+        layout: { "line-cap": "round", "line-join": "round" },
+        paint: { "line-color": "#f4fff8", "line-width": 2.2, "line-opacity": 0.9 },
+      },
+      {
+        id: "quiet",
+        type: "circle",
+        source: "quiet",
+        paint: {
+          "circle-radius": ["interpolate", ["linear"], ["zoom"], 1, 2, 6, 4],
+          "circle-color": groupColor(),
+          "circle-opacity": 0.45,
+        },
+      },
+      {
+        id: "clusters",
+        type: "circle",
+        source: "sightings",
+        filter: ["has", "point_count"],
+        paint: {
+          "circle-color": "rgba(231,244,241,0.16)",
+          "circle-stroke-color": "rgba(231,244,241,0.55)",
+          "circle-stroke-width": 1,
+          "circle-radius": ["interpolate", ["linear"], ["get", "point_count"], 2, 6, 20, 10, 100, 15],
+        },
+      },
+      {
+        id: "sightings",
+        type: "circle",
+        source: "sightings",
+        filter: ["!", ["has", "point_count"]],
+        paint: {
+          "circle-radius": ["interpolate", ["linear"], ["zoom"], 1, 2.6, 6, 5],
+          "circle-color": groupColor(),
+          "circle-opacity": 0.8,
+          "circle-stroke-color": "rgba(7,16,22,0.8)",
+          "circle-stroke-width": 1,
+        },
+      },
+    ],
+  };
+  return style as unknown as StyleSpecification;
 }
 
-function destination(lat: number, lng: number, heading: number, km: number) {
-  const d = km / 6371;
-  const br = heading * D2R;
-  const φ1 = lat * D2R;
-  const λ1 = lng * D2R;
-  const φ2 = Math.asin(Math.sin(φ1) * Math.cos(d) + Math.cos(φ1) * Math.sin(d) * Math.cos(br));
-  const λ2 =
-    λ1 + Math.atan2(Math.sin(br) * Math.sin(d) * Math.cos(φ1), Math.cos(d) - Math.sin(φ1) * Math.sin(φ2));
-  return { lat: (φ2 * R2D), lng: wrapLng((λ2 * R2D)) };
-}
-
-function liveFix(points: TrackPoint[], now: number, hold: boolean): { lat: number; lng: number } {
-  const last = points[points.length - 1];
-  if (points.length < 2) return last;
-  const lastAt = Date.parse(last.at);
-  if (!Number.isFinite(lastAt)) return last;
-  if (now < lastAt) {
-    for (let i = 1; i < points.length; i += 1) {
-      const t0 = Date.parse(points[i - 1].at);
-      const t1 = Date.parse(points[i].at);
-      if (!Number.isFinite(t0) || !Number.isFinite(t1) || now > t1) continue;
-      const span = t1 - t0;
-      const mix = span > 0 ? clamp((now - t0) / span, 0, 1) : 1;
-      return along([points[i - 1], points[i]], mix);
-    }
-    return last;
-  }
-  if (hold) return last;
-  const prev = points[points.length - 2];
-  const prevAt = Date.parse(prev.at);
-  const hop = lastAt - prevAt;
-  const km = kmBetween(prev, last);
-  if (!Number.isFinite(prevAt) || hop < 60_000 || hop > 36 * 3_600_000) return last;
-  const kmh = km / (hop / 3_600_000);
-  if (km < 0.4 || kmh < 0.15 || kmh > 25) return last;
-  const age = now - lastAt;
-  if (age > 8 * 3_600_000) return last;
-  const extraKm = Math.min(kmh * (age / 3_600_000), 40);
-  const frac = extraKm / km;
+function point(signal: Signal): Feature {
   return {
-    lat: clamp(last.lat + (last.lat - prev.lat) * frac, -85, 85),
-    lng: wrapLng(last.lng + deltaLng(prev.lng, last.lng) * frac),
+    type: "Feature",
+    properties: { id: signal.id, group: signal.group, name: signal.name, common: signal.common },
+    geometry: { type: "Point", coordinates: [signal.lng, signal.lat] },
   };
-}
-
-function radiusFor(zoom: number, w: number, h: number): number {
-  return Math.min(w, h) * 0.4 * Math.pow(1.85, zoom);
-}
-
-function basis(lat: number, lng: number): Basis {
-  const φ = lat * D2R;
-  const λ = lng * D2R;
-  const cφ = Math.cos(φ);
-  const sφ = Math.sin(φ);
-  const cλ = Math.cos(λ);
-  const sλ = Math.sin(λ);
-  const fx = cφ * cλ;
-  const fy = cφ * sλ;
-  const fz = sφ;
-  let rx = -fy;
-  let ry = fx;
-  const rl = Math.hypot(rx, ry) || 1;
-  rx /= rl;
-  ry /= rl;
-  const rz = 0;
-  const ux = fy * rz - fz * ry;
-  const uy = fz * rx - fx * rz;
-  const uz = fx * ry - fy * rx;
-  return { fx, fy, fz, rx, ry, rz, ux, uy, uz };
-}
-
-function project(
-  lat: number,
-  lng: number,
-  b: Basis,
-  cx: number,
-  cy: number,
-  radius: number,
-): { x: number; y: number } | null {
-  const φ = lat * D2R;
-  const λ = lng * D2R;
-  const cφ = Math.cos(φ);
-  const x = cφ * Math.cos(λ);
-  const y = cφ * Math.sin(λ);
-  const z = Math.sin(φ);
-  const nz = x * b.fx + y * b.fy + z * b.fz;
-  if (nz < 0.04) return null;
-  const nx = x * b.rx + y * b.ry + z * b.rz;
-  const ny = x * b.ux + y * b.uy + z * b.uz;
-  return { x: cx + nx * radius, y: cy - ny * radius };
-}
-
-/** Unit vector toward the sun in the globe's frame, from a low-precision solar position. */
-function sunVector(at: number): [number, number, number] {
-  const date = new Date(at);
-  const start = Date.UTC(date.getUTCFullYear(), 0, 0);
-  const day = (at - start) / 86_400_000;
-  const decl = -23.44 * Math.cos(((2 * Math.PI) / 365) * (day + 10)) * D2R;
-  const hours = date.getUTCHours() + date.getUTCMinutes() / 60 + date.getUTCSeconds() / 3600;
-  const lng = wrapLng(-(hours - 12) * 15) * D2R;
-  return [Math.cos(decl) * Math.cos(lng), Math.cos(decl) * Math.sin(lng), Math.sin(decl)];
-}
-
-function makeStars(count: number): { x: number; y: number; r: number; a: number }[] {
-  let seed = 7;
-  const rand = () => {
-    seed = (seed * 16807) % 2147483647;
-    return seed / 2147483647;
-  };
-  return Array.from({ length: count }, () => ({
-    x: rand(),
-    y: rand(),
-    r: rand() < 0.08 ? 1.3 : 0.7,
-    a: 0.18 + rand() * 0.5,
-  }));
-}
-
-const STARS = makeStars(240);
-
-function phaseFor(id: string): number {
-  let hash = 0;
-  for (let i = 0; i < id.length; i += 1) hash = (hash * 31 + id.charCodeAt(i)) | 0;
-  return ((hash >>> 0) % 1000) / 1000;
-}
-
-/** What a terrain pass needs to shade the globe for one camera position. */
-type Shade = {
-  radius: number;
-  b: Basis;
-  cx: number;
-  cy: number;
-  night: number;
-  sun: [number, number, number];
-  detail: number;
-};
-
-type Surface = {
-  canvas: HTMLCanvasElement;
-  ctx: CanvasRenderingContext2D | null;
-  buf: ImageData | null;
-};
-
-function makeSurface(): Surface {
-  return { canvas: document.createElement("canvas"), ctx: null, buf: null };
-}
-
-/**
- * Grows a surface in place; the canvas element is never replaced and never shrinks, so
- * mobile toolbars sliding in and out don't reallocate megabytes on every resize.
- */
-function sizeSurface(surface: Surface, width: number, height: number) {
-  if (surface.canvas.width >= width && surface.canvas.height >= height && surface.buf) return;
-  surface.canvas.width = Math.max(width, surface.canvas.width);
-  surface.canvas.height = Math.max(height, surface.canvas.height);
-  width = surface.canvas.width;
-  height = surface.canvas.height;
-  surface.ctx ??= surface.canvas.getContext("2d");
-  surface.buf = surface.ctx ? surface.ctx.createImageData(width, height) : null;
-}
-
-function tileX(lng: number, z: number): number {
-  return ((lng + 180) / 360) * 2 ** z;
-}
-
-function tileY(lat: number, z: number): number {
-  const s = Math.sin(clamp(lat, -85, 85) * D2R);
-  return (0.5 - Math.log((1 + s) / (1 - s)) / (4 * Math.PI)) * 2 ** z;
 }
 
 function GlobeViewInner({ signals, routes, selectedId, onSelect, jump }: Props) {
   const wrapRef = useRef<HTMLDivElement | null>(null);
-  const canvasRef = useRef<HTMLCanvasElement | null>(null);
-  const signalsRef = useRef(signals);
-  const routesRef = useRef(routes);
-  const selectedRef = useRef(selectedId);
+  const mapRef = useRef<MapLibreMap | null>(null);
+  const markersRef = useRef(new Map<string, Entry>());
+  const tipRef = useRef<HTMLDivElement | null>(null);
+  const spinRef = useRef(true);
   const onSelectRef = useRef(onSelect);
-  const jumpRef = useRef(jump);
-  const viewRef = useRef<View>({ zoom: 0, lng: -40, lat: 18 });
-  const targetRef = useRef<View>({ zoom: 0, lng: -40, lat: 18 });
-  const hitsRef = useRef<Hit[]>([]);
-  signalsRef.current = signals;
-  routesRef.current = routes;
-  selectedRef.current = selectedId;
+  const [ready, setReady] = useState(false);
+  const [failed, setFailed] = useState<string | null>(null);
+  const [tick, setTick] = useState(0);
   onSelectRef.current = onSelect;
-  jumpRef.current = jump;
 
+  // Create the map once. MapLibre touches `window` on import, so load it in the browser only.
   useEffect(() => {
-    const canvas = canvasRef.current;
-    const wrap = wrapRef.current;
-    if (!canvas || !wrap) return;
-    const ctx = canvas.getContext("2d");
-    if (!ctx) return;
-
-    const earth = new Image();
-    earth.src = `${import.meta.env.BASE_URL}earth.jpg`;
-    let earthPx: Uint8ClampedArray | null = null;
-    let earthW = 0;
-    let earthH = 0;
-    earth.onload = () => {
-      const scratch = document.createElement("canvas");
-      scratch.width = earth.width;
-      scratch.height = earth.height;
-      const ictx = scratch.getContext("2d", { willReadFrequently: true });
-      if (!ictx) return;
-      ictx.drawImage(earth, 0, 0);
-      const data = ictx.getImageData(0, 0, scratch.width, scratch.height);
-      earthPx = data.data;
-      earthW = scratch.width;
-      earthH = scratch.height;
-      // iOS frees canvas memory lazily; release the scratch right away.
-      scratch.width = 0;
-      scratch.height = 0;
-      invalidate();
-    };
-
-    const tiles = new Map<string, TileEntry>();
+    let cancelled = false;
+    let map: MapLibreMap | null = null;
     const reduced = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
-    const pointers = new Map<number, { x: number; y: number }>();
-    let frame = 0;
-    let dragged = 0;
-    let spin = !reduced;
-    let hoverId: string | null = null;
-    let sun = sunVector(Date.now());
-    let sunAt = Date.now();
-    let velLat = 0;
-    let velLng = 0;
-    let filtDx = 0;
-    let filtDy = 0;
-    let lastGesture = 0;
-    let prevFrame = performance.now();
-    let pinchDist = 0;
-    let pinchX = 0;
-    let pinchY = 0;
-    let lastTap = 0;
-    let lastTapX = 0;
-    let lastTapY = 0;
-    let lastSelected: string | null = null;
-    let seenJump = 0;
-    let tilePending = false;
-    const shown = new Map<string, { lat: number; lng: number }>();
-    // Terrain surfaces are allocated once per viewport size and reused every frame:
-    // re-creating canvases as the camera starts and stops leaks memory on iOS and blanks the globe.
-    const lo = makeSurface();
-    const hi = makeSurface();
-    let loKey = "";
-    let hiKey = "";
-    let hiRow = 0;
-    let hiReady = false;
-    let epoch = 0;
-    let lastInvalidate = 0;
-    let needsResize = true;
-    // Pixels the quick pass may shade per frame; tuned live from how long it takes.
-    let budget = 260_000;
-    let quickStride = 1;
-    const invalidate = () => {
-      epoch += 1;
-      lastInvalidate = performance.now();
-    };
-    const tileScratch = document.createElement("canvas");
-    const tileCtx = tileScratch.getContext("2d", { willReadFrequently: true });
-
-    const lookupTile = (z: number, x: number, y: number): TileEntry | null => {
-      const n = 2 ** z;
-      if (y < 0 || y >= n) return null;
-      const wrapped = ((x % n) + n) % n;
-      return tiles.get(`${z}/${y}/${wrapped}`) ?? null;
-    };
-
-    const requestTile = (z: number, x: number, y: number) => {
-      const n = 2 ** z;
-      if (y < 0 || y >= n || z < 0 || z > 10) return;
-      const wrapped = ((x % n) + n) % n;
-      const key = `${z}/${y}/${wrapped}`;
-      if (tiles.has(key)) return;
-      const img = new Image();
-      const created: TileEntry = { img, ready: false, pixels: null, w: 0, h: 0 };
-      img.onload = () => {
-        if (!tileCtx) return;
-        if (tileScratch.width !== img.width || tileScratch.height !== img.height) {
-          tileScratch.width = img.width;
-          tileScratch.height = img.height;
-        }
-        tileCtx.drawImage(img, 0, 0);
+    spinRef.current = !reduced;
+    void import("maplibre-gl")
+      .then(({ default: maplibregl }) => {
+        const wrap = wrapRef.current;
+        if (cancelled || !wrap) return;
+        const base = fitZoom(wrap.clientWidth, wrap.clientHeight);
         try {
-          created.pixels = tileCtx.getImageData(0, 0, img.width, img.height).data;
-        } catch {
-          return; // a tile served without CORS stays unreadable; the base texture covers it
+          map = new maplibregl.Map({
+            container: wrap,
+            style: buildStyle(),
+            center: [-40, 22],
+            zoom: base,
+            minZoom: base - 0.6,
+            maxZoom: 13,
+            attributionControl: false,
+            dragRotate: false,
+            pitchWithRotate: false,
+            touchPitch: false,
+            maxPitch: 0,
+            renderWorldCopies: false,
+            fadeDuration: 150,
+          });
+        } catch (error) {
+          setFailed(error instanceof Error ? error.message : "WebGL unavailable");
+          return;
         }
-        created.w = img.width;
-        created.h = img.height;
-        created.ready = true;
-        // A burst of tiles should not restart the sharp render on every arrival.
-        if (performance.now() - lastInvalidate > 150) invalidate();
-        else tilePending = true;
-      };
-      // Tiles are read back as pixels, so they must load as CORS images.
-      img.crossOrigin = "anonymous";
-      img.src = tileUrl(z, y, wrapped);
-      tiles.set(key, created);
-      if (tiles.size > 180) {
-        const oldest = tiles.keys().next().value;
-        if (oldest) tiles.delete(oldest);
-      }
-    };
+        const m = map;
+        // Credit up top, where it never sits under the dock or the animal card.
+        m.addControl(new maplibregl.AttributionControl({ compact: true }), "top-right");
+        m.touchZoomRotate.disableRotation();
+        m.keyboard.disableRotation();
+        mapRef.current = m;
 
-    const rgb: [number, number, number] = [0, 0, 0];
-    const sample = (lat: number, lng: number, z: number): [number, number, number] => {
-      // Web Mercator tiles stop at ±85°; the poles come from the base texture.
-      for (let level = Math.abs(lat) < 84.5 ? z : 0; level >= 3; level -= 1) {
-        const tx = tileX(lng, level);
-        const ty = tileY(lat, level);
-        const ix = Math.floor(tx);
-        const iy = Math.floor(ty);
-        const entry = lookupTile(level, ix, iy);
-        if (!entry?.pixels) continue;
-        const u = clamp(Math.floor((tx - ix) * entry.w), 0, entry.w - 1);
-        const v = clamp(Math.floor((ty - iy) * entry.h), 0, entry.h - 1);
-        const i = (v * entry.w + u) * 4;
-        rgb[0] = entry.pixels[i];
-        rgb[1] = entry.pixels[i + 1];
-        rgb[2] = entry.pixels[i + 2];
-        return rgb;
-      }
-      if (earthPx) {
-        // Bilinear: the base texture is low-res, and nearest-neighbour shimmers as the globe turns.
-        let u = ((lng + 180) / 360) * earthW - 0.5;
-        u = ((u % earthW) + earthW) % earthW;
-        const v = clamp(((90 - lat) / 180) * earthH - 0.5, 0, earthH - 1);
-        const u0 = Math.floor(u);
-        const v0 = Math.floor(v);
-        const u1 = (u0 + 1) % earthW;
-        const v1 = Math.min(earthH - 1, v0 + 1);
-        const fu = u - u0;
-        const fv = v - v0;
-        const a = (v0 * earthW + u0) * 4;
-        const b2 = (v0 * earthW + u1) * 4;
-        const c = (v1 * earthW + u0) * 4;
-        const d = (v1 * earthW + u1) * 4;
-        const w00 = (1 - fu) * (1 - fv);
-        const w10 = fu * (1 - fv);
-        const w01 = (1 - fu) * fv;
-        const w11 = fu * fv;
-        rgb[0] = earthPx[a] * w00 + earthPx[b2] * w10 + earthPx[c] * w01 + earthPx[d] * w11;
-        rgb[1] = earthPx[a + 1] * w00 + earthPx[b2 + 1] * w10 + earthPx[c + 1] * w01 + earthPx[d + 1] * w11;
-        rgb[2] = earthPx[a + 2] * w00 + earthPx[b2 + 2] * w10 + earthPx[c + 2] * w01 + earthPx[d + 2] * w11;
-        return rgb;
-      }
-      rgb[0] = 14;
-      rgb[1] = 92;
-      rgb[2] = 122;
-      return rgb;
-    };
-
-    // Setting a canvas's size clears it, even to the same value. Resize only on a real change,
-    // and only at the start of a paint so the cleared canvas is redrawn in the same frame.
-    /** Shades rows [y0, y1), columns [x0, x1) of a buffer; each buffer pixel covers `px` CSS pixels. */
-    const shadeRows = (
-      out: ImageData,
-      x0: number,
-      x1: number,
-      px: number,
-      y0: number,
-      y1: number,
-      sh: Shade,
-    ) => {
-      const pix = out.data;
-      const rowWidth = out.width;
-      const { radius, b, cx, cy, night, detail } = sh;
-      const [sx0, sy0, sz0] = sh.sun;
-      for (let y = y0; y < y1; y += 1) {
-        const ny = (cy - (y + 0.5) * px) / radius;
-        const row = y * rowWidth;
-        for (let x = x0; x < x1; x += 1) {
-          const nx = ((x + 0.5) * px - cx) / radius;
-          const i = (row + x) * 4;
-          const r2 = nx * nx + ny * ny;
-          if (r2 > 1) {
-            pix[i + 3] = 0;
-            continue;
-          }
-          const nz = Math.sqrt(1 - r2);
-          const wx = nx * b.rx + ny * b.ux + nz * b.fx;
-          const wy = nx * b.ry + ny * b.uy + nz * b.fy;
-          const wz = nx * b.rz + ny * b.uz + nz * b.fz;
-          const color = sample(Math.asin(clamp(wz, -1, 1)) * R2D, Math.atan2(wy, wx) * R2D, detail);
-          const light = 0.8 + 0.2 * nz;
-          let dark = 0;
-          if (night > 0) {
-            // A wide, eased terminator: dusk fades over ~20° instead of a hard line.
-            const t = clamp((wx * sx0 + wy * sy0 + wz * sz0 + 0.18) / 0.36, 0, 1);
-            dark = night * (1 - t * t * (3 - 2 * t));
-          }
-          pix[i] = color[0] * light * (1 - dark);
-          pix[i + 1] = color[1] * light * (1 - dark * 0.9);
-          pix[i + 2] = color[2] * light * (1 - dark * 0.72);
-          // Soft edge: anti-alias the limb instead of a jagged stair-step.
-          const edge = (1 - Math.sqrt(r2)) * radius;
-          pix[i + 3] = edge < px ? Math.max(0, (edge / px) * 255) : 255;
-        }
-      }
-    };
-
-    const requestVisibleTiles = (w: number, h: number, radius: number, b: Basis, detail: number) => {
-      const tilePx = ((360 / 2 ** detail) * radius * Math.PI) / 180;
-      const step = Math.max(36, Math.min(tilePx * 0.75, 240));
-      for (let sy = 0; sy <= h; sy += step) {
-        for (let sx = 0; sx <= w; sx += step) {
-          const nnx = (sx - w / 2) / radius;
-          const nny = (h / 2 - sy) / radius;
-          const rr = nnx * nnx + nny * nny;
-          if (rr > 1) continue;
-          const nnz = Math.sqrt(1 - rr);
-          const wwx = nnx * b.rx + nny * b.ux + nnz * b.fx;
-          const wwy = nnx * b.ry + nny * b.uy + nnz * b.fy;
-          const wwz = nnx * b.rz + nny * b.uz + nnz * b.fz;
-          const plat = Math.asin(clamp(wwz, -1, 1)) * R2D;
-          const plng = Math.atan2(wwy, wwx) * R2D;
-          requestTile(detail, Math.floor(tileX(plng, detail)), Math.floor(tileY(plat, detail)));
-          if (detail > 4) {
-            requestTile(detail - 1, Math.floor(tileX(plng, detail - 1)), Math.floor(tileY(plat, detail - 1)));
-          }
-        }
-      }
-    };
-
-    const resize = (w: number, h: number, dpr: number) => {
-      const cw = Math.max(2, Math.floor(w * dpr));
-      const ch = Math.max(2, Math.floor(h * dpr));
-      if (canvas.width !== cw || canvas.height !== ch) {
-        canvas.width = cw;
-        canvas.height = ch;
-      }
-      canvas.style.width = `${w}px`;
-      canvas.style.height = `${h}px`;
-      sizeSurface(lo, Math.ceil(w), Math.ceil(h));
-      sizeSurface(hi, Math.ceil(w * dpr), Math.ceil(h * dpr));
-      invalidate();
-    };
-    const observer = new ResizeObserver(() => {
-      needsResize = true;
-    });
-    observer.observe(wrap);
-
-    const screenPoint = (clientX: number, clientY: number, b: Basis, radius: number, w: number, h: number) => {
-      const rect = canvas.getBoundingClientRect();
-      const sx = clientX - rect.left;
-      const sy = clientY - rect.top;
-      const nx = (sx - w / 2) / radius;
-      const ny = (h / 2 - sy) / radius;
-      const r2 = nx * nx + ny * ny;
-      if (r2 > 1) return null;
-      const nz = Math.sqrt(1 - r2);
-      const wx = nx * b.rx + ny * b.ux + nz * b.fx;
-      const wy = nx * b.ry + ny * b.uy + nz * b.fy;
-      const wz = nx * b.rz + ny * b.uz + nz * b.fz;
-      return {
-        lat: Math.asin(clamp(wz, -1, 1)) * R2D,
-        lng: Math.atan2(wy, wx) * R2D,
-      };
-    };
-
-    const zoomAbout = (clientX: number, clientY: number, before: number) => {
-      const aim = targetRef.current;
-      const shown = viewRef.current;
-      const w = wrap.clientWidth || window.innerWidth;
-      const h = wrap.clientHeight || window.innerHeight;
-      const r0 = radiusFor(before, w, h);
-      const r1 = radiusFor(aim.zoom, w, h);
-      const pull = clamp(1 - r0 / r1, -0.82, 0.82);
-      if (Math.abs(pull) < 0.001) return;
-      const spot = screenPoint(clientX, clientY, basis(shown.lat, shown.lng), radiusFor(shown.zoom, w, h), w, h);
-      if (!spot) return;
-      aim.lat = clamp(aim.lat + (spot.lat - aim.lat) * pull, -85, 85);
-      aim.lng = wrapLng(aim.lng + deltaLng(aim.lng, spot.lng) * pull);
-    };
-
-    const applyDrag = (dx: number, dy: number, dtMs: number) => {
-      filtDx = filtDx * 0.22 + dx * 0.78;
-      filtDy = filtDy * 0.22 + dy * 0.78;
-      const aim = targetRef.current;
-      const w = wrap.clientWidth || window.innerWidth;
-      const h = wrap.clientHeight || window.innerHeight;
-      const radius = Math.max(80, radiusFor(aim.zoom, w, h));
-      const dLat = (filtDy / radius) * R2D;
-      const cos = Math.max(0.22, Math.cos(aim.lat * D2R));
-      const dLng = -(filtDx / (radius * cos)) * R2D;
-      aim.lat = clamp(aim.lat + dLat, -85, 85);
-      aim.lng = wrapLng(aim.lng + dLng);
-      const perFrame = 16.67 / Math.max(8, Math.min(48, dtMs));
-      velLat = dLat * perFrame;
-      velLng = dLng * perFrame;
-      spin = false;
-    };
-
-    const paint = (now: number) => {
-      const w = wrap.clientWidth || window.innerWidth;
-      const h = wrap.clientHeight || window.innerHeight;
-      const dpr = Math.min(2, window.devicePixelRatio || 1);
-      if (needsResize || canvas.width !== Math.floor(w * dpr) || canvas.height !== Math.floor(h * dpr)) {
-        needsResize = false;
-        resize(w, h, dpr);
-      }
-      if (tilePending && performance.now() - lastInvalidate > 150) {
-        tilePending = false;
-        invalidate();
-      }
-      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-      const view = viewRef.current;
-      const aim = targetRef.current;
-      const dt = Math.min(48, Math.max(1, now - prevFrame));
-      prevFrame = now;
-      const interacting = pointers.size > 0;
-      if (!interacting && !reduced && (Math.abs(velLat) > 0.004 || Math.abs(velLng) > 0.004)) {
-        const step = dt / 16.67;
-        aim.lat = clamp(aim.lat + velLat * step, -85, 85);
-        aim.lng = wrapLng(aim.lng + velLng * step);
-        const friction = Math.exp(-dt / 340);
-        velLat *= friction;
-        velLng *= friction;
-      } else if (!interacting) {
-        velLat = 0;
-        velLng = 0;
-      }
-      if (spin && !interacting && !reduced && aim.zoom < 0.25 && Math.abs(velLng) < 0.01) {
-        aim.lng = wrapLng(aim.lng + 0.07 * (dt / 16.67));
-      }
-      if (selectedRef.current !== lastSelected) {
-        lastSelected = selectedRef.current;
-        const picked = signalsRef.current.find((signal) => signal.id === lastSelected);
-        if (picked) {
-          const route = routesRef.current.find((item) => item.id === picked.id);
-          const fix = route && route.points.length > 1 ? liveFix(route.points, Date.now(), reduced) : null;
-          aim.lng = fix?.lng ?? picked.lng;
-          aim.lat = clamp(fix?.lat ?? picked.lat, -85, 85);
-          aim.zoom = Math.max(aim.zoom, 3.1);
-          spin = false;
-          velLat = 0;
-          velLng = 0;
-        }
-      }
-      const nextJump = jumpRef.current;
-      if (nextJump && nextJump.id !== seenJump) {
-        seenJump = nextJump.id;
-        aim.lat = clamp(nextJump.lat, -85, 85);
-        aim.lng = wrapLng(nextJump.lng);
-        aim.zoom = clamp(nextJump.zoom, ZOOM_MIN, ZOOM_MAX);
-        spin = false;
-        velLat = 0;
-        velLng = 0;
-      }
-      const tau = reduced ? 1 : interacting ? 28 : 88;
-      const follow = reduced ? 1 : 1 - Math.exp(-dt / tau);
-      const gapLat = aim.lat - view.lat;
-      const gapLng = deltaLng(view.lng, aim.lng);
-      const gapZoom = aim.zoom - view.zoom;
-      if (Math.abs(gapLat) > 0.0005 || Math.abs(gapLng) > 0.0005 || Math.abs(gapZoom) > 0.0005) {
-        view.lat = clamp(view.lat + gapLat * follow, -85, 85);
-        view.lng = wrapLng(view.lng + gapLng * follow);
-        view.zoom = clamp(view.zoom + gapZoom * follow, ZOOM_MIN, ZOOM_MAX);
-      }
-      const gliding =
-        Math.abs(aim.lat - view.lat) > 0.02 ||
-        Math.abs(deltaLng(view.lng, aim.lng)) > 0.02 ||
-        Math.abs(aim.zoom - view.zoom) > 0.012;
-
-      if (Date.now() - sunAt > 60_000) {
-        sunAt = Date.now();
-        sun = sunVector(sunAt);
-        invalidate();
-      }
-      const radius = radiusFor(view.zoom, w, h);
-      const b = basis(view.lat, view.lng);
-      const movingCamera =
-        interacting || gliding || Math.abs(velLat) > 0.004 || Math.abs(velLng) > 0.004;
-      const resting = !movingCamera && !spin;
-      // Moving: shade as many pixels as the device keeps up with. Resting: full resolution.
-      // Pixels in the globe's bounding box at full resolution (what the quick pass would shade).
-      const globePx = Math.min(4 * radius * radius, w * h);
-      // The resting frame is sharpened separately (below), so the quick pass keeps its moving
-      // resolution and letting go of the globe never stalls a frame.
-      // Hysteresis: change resolution only when the budget is clearly past the next step,
-      // so the globe does not flicker between sharp and soft while it moves.
-      if (quickStride < 3 && globePx / (quickStride * quickStride) > budget * 1.2) quickStride += 1;
-      else if (quickStride > 1 && globePx / ((quickStride - 1) * (quickStride - 1)) < budget * 0.8) {
-        quickStride -= 1;
-      }
-      const stride = quickStride;
-      const bw = Math.max(2, Math.ceil(w / stride));
-      const bh = Math.max(2, Math.ceil(h / stride));
-      const view4 = `${view.lat.toFixed(3)}|${view.lng.toFixed(3)}|${view.zoom.toFixed(3)}|${epoch}`;
-      // At rest, swap the low-res base texture for satellite tiles matched to the screen:
-      // a phone's globe gets the 64-tile world, a large retina globe the 256-tile one.
-      const globeDevicePx = radius * dpr;
-      const detail =
-        radius > Math.min(w, h) * 0.72
-          ? clamp(Math.round(Math.log2(((radius * Math.PI) / 180) * (360 / 256))), 3, 10)
-          : !resting
-            ? 0
-            : globeDevicePx >= 900
-              ? 4
-              : globeDevicePx >= 280
-                ? 3
-                : 0;
-      const shade: Shade = {
-        radius,
-        b,
-        cx: w / 2,
-        cy: h / 2,
-        // Night shading fades out as you zoom in, so close-up imagery stays readable.
-        night: clamp((3 - view.zoom) / 2, 0, 1) * 0.5,
-        sun,
-        detail,
-      };
-      // Only the globe's bounding box is shaded and drawn; the space around it stays empty.
-      const box = (px: number, maxW: number, maxH: number) => ({
-        x0: clamp(Math.floor((w / 2 - radius) / px) - 1, 0, maxW),
-        x1: clamp(Math.ceil((w / 2 + radius) / px) + 1, 0, maxW),
-        y0: clamp(Math.floor((h / 2 - radius) / px) - 1, 0, maxH),
-        y1: clamp(Math.ceil((h / 2 + radius) / px) + 1, 0, maxH),
-      });
-      const loBox = box(stride, bw, bh);
-      const nextLoKey = `${view4}|${stride}|${detail}`;
-      if (nextLoKey !== loKey && lo.ctx && lo.buf) {
-        loKey = nextLoKey;
-        if (detail >= 3) requestVisibleTiles(w, h, radius, b, detail);
-        const t0 = performance.now();
-        shadeRows(lo.buf, loBox.x0, loBox.x1, stride, loBox.y0, loBox.y1, shade);
-        lo.ctx.putImageData(
-          lo.buf,
-          0,
-          0,
-          loBox.x0,
-          loBox.y0,
-          loBox.x1 - loBox.x0,
-          loBox.y1 - loBox.y0,
-        );
-        const spent = performance.now() - t0;
-        if (!resting && spent > 0.5) {
-          // Aim the quick pass at ~7 ms, from the measured cost of each shaded pixel.
-          const shaded = (loBox.x1 - loBox.x0) * (loBox.y1 - loBox.y0);
-          const target = (7 / spent) * shaded;
-          budget = clamp(budget * 0.7 + target * 0.3, 20_000, 1_500_000);
-        }
-      }
-      // Resting: sharpen to full device resolution in slices across frames, not one long stall.
-      const sharpen = resting && Boolean(hi.ctx && hi.buf);
-      if (sharpen && hi.buf && hi.ctx) {
-        const nextHiKey = `${view4}|${detail}`;
-        if (nextHiKey !== hiKey) {
-          hiKey = nextHiKey;
-          hiRow = 0;
-          hiReady = false;
-        }
-        const hiBox = box(1 / dpr, Math.ceil(w * dpr), Math.ceil(h * dpr));
-        if (!hiReady) {
-          if (hiRow < hiBox.y0) hiRow = hiBox.y0;
-          const t0 = performance.now();
-          while (hiRow < hiBox.y1 && performance.now() - t0 < 6) {
-            const next = Math.min(hiBox.y1, hiRow + 16);
-            shadeRows(hi.buf, hiBox.x0, hiBox.x1, 1 / dpr, hiRow, next, shade);
-            hiRow = next;
-          }
-          if (hiRow >= hiBox.y1) {
-            hi.ctx.putImageData(
-              hi.buf,
-              0,
-              0,
-              hiBox.x0,
-              hiBox.y0,
-              hiBox.x1 - hiBox.x0,
-              hiBox.y1 - hiBox.y0,
-            );
-            hiReady = true;
-          }
-        }
-      } else {
-        hiKey = "";
-        hiReady = false;
-      }
-      ctx.fillStyle = "#071016";
-      ctx.fillRect(0, 0, w, h);
-      if (radius < Math.hypot(w, h) * 0.5) {
-        const drift = view.lng / 360;
-        ctx.fillStyle = "#cfe9e3";
-        for (const star of STARS) {
-          const x = (((star.x - drift * 0.18) % 1) + 1) % 1;
-          ctx.globalAlpha = star.a;
-          ctx.fillRect(x * w, star.y * h, star.r, star.r);
-        }
-        ctx.globalAlpha = 1;
-      }
-      if (radius < Math.min(w, h) * 0.72) {
-        const glow = ctx.createRadialGradient(w / 2, h / 2, radius * 0.96, w / 2, h / 2, radius * 1.22);
-        glow.addColorStop(0, "rgba(62,224,197,0.34)");
-        glow.addColorStop(0.18, "rgba(62,224,197,0.16)");
-        glow.addColorStop(0.5, "rgba(62,224,197,0.05)");
-        glow.addColorStop(1, "rgba(62,224,197,0)");
-        ctx.fillStyle = glow;
-        ctx.beginPath();
-        ctx.arc(w / 2, h / 2, radius * 1.22, 0, Math.PI * 2);
-        ctx.fill();
-      }
-      ctx.imageSmoothingEnabled = true;
-      if (sharpen && hiReady) {
-        const hb = box(1 / dpr, Math.ceil(w * dpr), Math.ceil(h * dpr));
-        const sw = hb.x1 - hb.x0;
-        const sh2 = hb.y1 - hb.y0;
-        if (sw > 0 && sh2 > 0) {
-          ctx.drawImage(hi.canvas, hb.x0, hb.y0, sw, sh2, hb.x0 / dpr, hb.y0 / dpr, sw / dpr, sh2 / dpr);
-        }
-      } else {
-        const sw = loBox.x1 - loBox.x0;
-        const sh2 = loBox.y1 - loBox.y0;
-        if (sw > 0 && sh2 > 0) {
-          ctx.drawImage(
-            lo.canvas,
-            loBox.x0,
-            loBox.y0,
-            sw,
-            sh2,
-            loBox.x0 * stride,
-            loBox.y0 * stride,
-            sw * stride,
-            sh2 * stride,
-          );
-        }
-      }
-      if (radius < Math.hypot(w, h) * 0.55) {
-        ctx.beginPath();
-        ctx.arc(w / 2, h / 2, radius, 0, Math.PI * 2);
-        ctx.strokeStyle = "rgba(62,224,197,0.45)";
-        ctx.lineWidth = 1;
-        ctx.stroke();
-      }
-
-      const put = (lat: number, lng: number) => project(lat, lng, b, w / 2, h / 2, radius);
-      const gridAlpha = 0.09 * clamp(2.4 - view.zoom, 0, 1);
-      if (gridAlpha > 0.005) {
-        ctx.strokeStyle = `rgba(62,224,197,${gridAlpha.toFixed(3)})`;
-        ctx.lineWidth = 1;
-        ctx.beginPath();
-        const trace = (fn: (t: number) => { lat: number; lng: number }, steps: number) => {
-          let started = false;
-          for (let k = 0; k <= steps; k += 1) {
-            const at = fn(k / steps);
-            const p = put(at.lat, at.lng);
-            if (!p) {
-              started = false;
-              continue;
-            }
-            if (started) ctx.lineTo(p.x, p.y);
-            else ctx.moveTo(p.x, p.y);
-            started = true;
-          }
+        const stopSpin = () => {
+          spinRef.current = false;
         };
-        for (let lng = -180; lng < 180; lng += 30) trace((t) => ({ lat: -80 + t * 160, lng }), 48);
-        for (let lat = -60; lat <= 60; lat += 30) trace((t) => ({ lat, lng: -180 + t * 360 }), 120);
-        ctx.stroke();
-      }
-
-      const wall = Date.now();
-      const moving = new Map<string, { lat: number; lng: number }>();
-      const legs = new Map<string, { heading: number }>();
-      for (const route of routesRef.current) {
-        if (route.points.length < 2) continue;
-        moving.set(route.id, liveFix(route.points, wall, reduced));
-        const leg = trackLeg(route.points);
-        if (leg) legs.set(route.id, leg);
-      }
-      const dotFollow = reduced ? 1 : 1 - Math.exp(-dt / 1600);
-      const dots: Dot[] = signalsRef.current.map((signal) => {
-        const live = moving.get(signal.id);
-        const targetLat = live?.lat ?? signal.lat;
-        const targetLng = live?.lng ?? signal.lng;
-        const prev = shown.get(signal.id);
-        let lat = targetLat;
-        let lng = targetLng;
-        if (prev && kmBetween(prev, { lat: targetLat, lng: targetLng }) < 250) {
-          lat = prev.lat + (targetLat - prev.lat) * dotFollow;
-          lng = wrapLng(prev.lng + deltaLng(prev.lng, targetLng) * dotFollow);
-        }
-        shown.set(signal.id, { lat, lng });
-        return {
-          id: signal.id,
-          lat,
-          lng,
-          group: signal.group,
-          moving: Boolean(live),
-          kind: signal.kind,
-          name: signal.name,
-          common: signal.common,
-          heading: legs.get(signal.id)?.heading ?? null,
-          fresh: Date.now() - Date.parse(signal.observedAt) < 120 * 86_400_000,
-          hearing: Boolean(signal.heard?.recent.length),
-          hot: signal.kind === "tag" && wall - Date.parse(signal.observedAt) < 48 * 3_600_000,
-          phase: phaseFor(signal.id),
+        // Spin slowly until the first interaction, like a globe on a desk.
+        const spin = () => {
+          if (!spinRef.current || m.getZoom() > base + 1) return;
+          const center = m.getCenter();
+          center.lng -= 3;
+          m.easeTo({ center, duration: 2000, easing: (n) => n });
         };
+        m.on("mousedown", stopSpin);
+        m.on("touchstart", stopSpin);
+        m.on("wheel", stopSpin);
+        m.on("moveend", spin);
+
+        const select = (event: { features?: MapGeoJSONFeature[] }) => {
+          const id = event.features?.[0]?.properties?.id;
+          if (typeof id === "string") onSelectRef.current(id);
+        };
+        m.on("click", "sightings", select);
+        m.on("click", "quiet", select);
+        m.on("click", "clusters", (event) => {
+          const feature = event.features?.[0];
+          const source = m.getSource("sightings") as GeoJSONSource | undefined;
+          const clusterId = feature?.properties?.cluster_id;
+          if (!feature || !source || typeof clusterId !== "number" || feature.geometry.type !== "Point") return;
+          stopSpin();
+          const [lng, lat] = feature.geometry.coordinates;
+          void source.getClusterExpansionZoom(clusterId).then((zoom) => {
+            m.easeTo({ center: [lng, lat], zoom: Math.min(zoom + 0.3, 9), duration: 600 });
+          });
+        });
+
+        // Desktop hover: name and species beside the cursor.
+        const showTip = (event: { point: { x: number; y: number }; features?: MapGeoJSONFeature[] }) => {
+          const tip = tipRef.current;
+          const props = event.features?.[0]?.properties;
+          if (!tip || !props) return;
+          m.getCanvas().style.cursor = "pointer";
+          tip.textContent = "";
+          const name = document.createElement("strong");
+          name.textContent = String(props.name ?? "");
+          const sub = document.createElement("span");
+          sub.textContent = String(props.common ?? "");
+          tip.append(name, sub);
+          tip.style.transform = `translate(${event.point.x + 14}px, ${event.point.y - 46}px)`;
+          tip.hidden = false;
+        };
+        const hideTip = () => {
+          m.getCanvas().style.cursor = "";
+          if (tipRef.current) tipRef.current.hidden = true;
+        };
+        for (const layer of ["sightings", "quiet"]) {
+          m.on("mousemove", layer, showTip);
+          m.on("mouseleave", layer, hideTip);
+        }
+        m.on("mouseenter", "clusters", () => {
+          m.getCanvas().style.cursor = "zoom-in";
+        });
+        m.on("mouseleave", "clusters", hideTip);
+
+        m.on("load", () => {
+          if (cancelled) return;
+          setNight(m, Date.now());
+          setReady(true);
+          spin();
+        });
+      })
+      .catch((error: unknown) => {
+        setFailed(error instanceof Error ? error.message : "Map failed to load");
       });
-      const layer = { sighting: 0, heard: 1, tag: 2 } as const;
-      dots.sort((a, b) => layer[a.kind] - layer[b.kind]);
-      const focus = routesRef.current.find((route) => route.id === selectedRef.current)?.points ?? null;
-      const hits: Hit[] = [];
-
-      // Fading wakes behind every recently moving tag: the last few weeks of pings.
-      ctx.lineWidth = 1.4;
-      ctx.lineCap = "round";
-      for (const route of routesRef.current) {
-        if (route.id === selectedRef.current || route.points.length < 2) continue;
-        const last = route.points[route.points.length - 1];
-        const lastAt = Date.parse(last.at);
-        if (!Number.isFinite(lastAt) || wall - lastAt > 120 * 86_400_000) continue;
-        const tail = route.points.filter((point) => lastAt - Date.parse(point.at) <= 30 * 86_400_000).slice(-16);
-        const head = shown.get(route.id);
-        const path = head ? [...tail, { ...head, at: last.at }] : tail;
-        if (path.length < 2) continue;
-        ctx.strokeStyle = COLORS[route.group];
-        let prev = put(path[0].lat, path[0].lng);
-        for (let k = 1; k < path.length; k += 1) {
-          const next = put(path[k].lat, path[k].lng);
-          if (prev && next) {
-            ctx.globalAlpha = 0.08 + 0.5 * (k / (path.length - 1));
-            ctx.beginPath();
-            ctx.moveTo(prev.x, prev.y);
-            ctx.lineTo(next.x, next.y);
-            ctx.stroke();
-          }
-          prev = next;
-        }
-      }
-      ctx.globalAlpha = 1;
-
-      if (focus && focus.length > 1) {
-        ctx.beginPath();
-        let started = false;
-        for (const point of focus) {
-          const p = put(point.lat, point.lng);
-          if (!p) {
-            started = false;
-            continue;
-          }
-          if (!started) {
-            ctx.moveTo(p.x, p.y);
-            started = true;
-          } else ctx.lineTo(p.x, p.y);
-        }
-        ctx.strokeStyle = "rgba(244,255,248,0.9)";
-        ctx.lineWidth = 2;
-        ctx.stroke();
-      }
-
-      const dotScale = clamp(0.85 + view.zoom * 0.12, 0.85, 2.4);
-      for (const dot of dots) {
-        const p = put(dot.lat, dot.lng);
-        if (!p || p.x < -24 || p.y < -24 || p.x > w + 24 || p.y > h + 24) continue;
-        if (dot.kind === "heard") {
-          const picked = dot.id === selectedRef.current;
-          const ring = (picked ? 9 : 5.5) * dotScale;
-          ctx.strokeStyle = COLORS[dot.group];
-          if (dot.hearing && !reduced) {
-            const phase = (now % 2400) / 2400;
-            ctx.globalAlpha = 0.6 * (1 - phase);
-            ctx.lineWidth = 1.5;
-            ctx.beginPath();
-            ctx.arc(p.x, p.y, ring * (1 + phase * 1.8), 0, Math.PI * 2);
-            ctx.stroke();
-          }
-          ctx.globalAlpha = dot.hearing ? 1 : 0.6;
-          ctx.lineWidth = 2;
-          ctx.beginPath();
-          ctx.arc(p.x, p.y, ring, 0, Math.PI * 2);
-          ctx.stroke();
-          ctx.fillStyle = COLORS[dot.group];
-          ctx.beginPath();
-          ctx.arc(p.x, p.y, ring * 0.32, 0, Math.PI * 2);
-          ctx.fill();
-          ctx.globalAlpha = 1;
-          if (picked) {
-            ctx.beginPath();
-            ctx.strokeStyle = "#f4fff8";
-            ctx.lineWidth = 1.5;
-            ctx.arc(p.x, p.y, ring + 5, 0, Math.PI * 2);
-            ctx.stroke();
-          }
-          hits.push({ id: dot.id, x: p.x, y: p.y });
-          continue;
-        }
-        const sighting = dot.kind === "sighting";
-        const quiet = dot.kind === "tag" && !dot.fresh;
-        const size =
-          (dot.id === selectedRef.current ? 7 : dot.fresh && dot.moving ? 4.6 : quiet ? 2 : sighting ? 2.2 : 3.2) *
-          dotScale;
-        if (!sighting && !quiet) {
-          ctx.beginPath();
-          ctx.fillStyle = COLORS[dot.group];
-          ctx.globalAlpha = 0.32;
-          ctx.arc(p.x, p.y, size * 2.2, 0, Math.PI * 2);
-          ctx.fill();
-        }
-        if (dot.hot && !reduced) {
-          // A sonar ping for tags that surfaced in the last 48 hours.
-          const t = (now / 2400 + dot.phase) % 1;
-          ctx.beginPath();
-          ctx.strokeStyle = COLORS[dot.group];
-          ctx.lineWidth = 1.5;
-          ctx.globalAlpha = 0.7 * (1 - t);
-          ctx.arc(p.x, p.y, size * (1.4 + 3.2 * t), 0, Math.PI * 2);
-          ctx.stroke();
-        }
-        ctx.globalAlpha = quiet ? 0.45 : sighting ? 0.62 : 1;
-        ctx.beginPath();
-        ctx.fillStyle = COLORS[dot.group];
-        ctx.arc(p.x, p.y, size, 0, Math.PI * 2);
-        ctx.fill();
-        ctx.globalAlpha = 1;
-        if (dot.heading !== null && dot.fresh && dot.kind === "tag") {
-          const tip = destination(dot.lat, dot.lng, dot.heading, 70);
-          const q = put(tip.lat, tip.lng);
-          if (q) {
-            ctx.beginPath();
-            ctx.strokeStyle = COLORS[dot.group];
-            ctx.lineWidth = 1.5;
-            ctx.moveTo(p.x, p.y);
-            ctx.lineTo(q.x, q.y);
-            ctx.stroke();
-          }
-        }
-        if (dot.id === selectedRef.current) {
-          ctx.beginPath();
-          ctx.strokeStyle = "#f4fff8";
-          ctx.lineWidth = 1.5;
-          ctx.arc(p.x, p.y, size + 5, 0, Math.PI * 2);
-          ctx.stroke();
-        }
-        hits.push({ id: dot.id, x: p.x, y: p.y });
-      }
-      const labeled: { x: number; y: number }[] = [];
-      ctx.font = "600 12px IBM Plex Mono, ui-monospace, monospace";
-      ctx.textBaseline = "middle";
-      const nameable = (dot: Dot) => dot.kind === "tag" || (dot.kind === "heard" && dot.hearing);
-      const named = [
-        ...dots.filter((dot) => nameable(dot) && dot.id !== selectedRef.current),
-        ...dots.filter((dot) => dot.id === selectedRef.current),
-      ];
-      for (const dot of named) {
-        const picked = dot.id === selectedRef.current;
-        if (!picked && (!dot.fresh || view.zoom < 1.15)) continue;
-        const p = put(dot.lat, dot.lng);
-        if (!p) continue;
-        if (!picked && labeled.some((item) => Math.hypot(item.x - p.x, item.y - p.y) < 108)) continue;
-        const text = dot.name.length > 18 ? `${dot.name.slice(0, 17)}…` : dot.name;
-        const tw = ctx.measureText(text).width;
-        let left = p.x + 12;
-        if (left + tw > w - 8) left = p.x - tw - 16;
-        ctx.fillStyle = "rgba(7,16,22,0.82)";
-        ctx.fillRect(left - 4, p.y - 9, tw + 8, 18);
-        ctx.fillStyle = "#e7f4f1";
-        ctx.fillText(text, left, p.y);
-        labeled.push(p);
-      }
-      const hovered = hoverId ? dots.find((dot) => dot.id === hoverId) : null;
-      if (hovered && hovered.id !== selectedRef.current) {
-        const p = put(hovered.lat, hovered.lng);
-        if (p) {
-          const title = hovered.name.length > 28 ? `${hovered.name.slice(0, 27)}…` : hovered.name;
-          const sub = `${hovered.kind === "tag" ? "Tag" : hovered.kind === "heard" ? "Hydrophone" : "Sighting"} · ${hovered.common}`;
-          const line2 = sub.length > 34 ? `${sub.slice(0, 33)}…` : sub;
-          ctx.font = "600 13px IBM Plex Mono, ui-monospace, monospace";
-          const tw1 = ctx.measureText(title).width;
-          ctx.font = "400 11px IBM Plex Mono, ui-monospace, monospace";
-          const tw2 = ctx.measureText(line2).width;
-          const bw2 = Math.max(tw1, tw2) + 20;
-          const bh2 = 44;
-          let left = p.x + 14;
-          let top = p.y - bh2 - 10;
-          if (left + bw2 > w - 8) left = p.x - bw2 - 14;
-          if (top < 8) top = p.y + 12;
-          ctx.fillStyle = "rgba(13,26,34,0.94)";
-          ctx.strokeStyle = COLORS[hovered.group];
-          ctx.lineWidth = 1;
-          ctx.beginPath();
-          ctx.roundRect(left, top, bw2, bh2, 8);
-          ctx.fill();
-          ctx.stroke();
-          ctx.textBaseline = "alphabetic";
-          ctx.fillStyle = "#e7f4f1";
-          ctx.font = "600 13px IBM Plex Mono, ui-monospace, monospace";
-          ctx.fillText(title, left + 10, top + 18);
-          ctx.fillStyle = "#8aa39c";
-          ctx.font = "400 11px IBM Plex Mono, ui-monospace, monospace";
-          ctx.fillText(line2, left + 10, top + 35);
-          ctx.beginPath();
-          ctx.strokeStyle = "#f4fff8";
-          ctx.arc(p.x, p.y, 9, 0, Math.PI * 2);
-          ctx.stroke();
-        }
-      }
-      hitsRef.current = hits;
-      frame = requestAnimationFrame(paint);
-    };
-    frame = requestAnimationFrame(paint);
-
-    const pinchPair = () => {
-      const pts = [...pointers.values()];
-      if (pts.length < 2) return null;
-      return {
-        dist: Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y),
-        x: (pts[0].x + pts[1].x) / 2,
-        y: (pts[0].y + pts[1].y) / 2,
-      };
-    };
-
-    const down = (event: PointerEvent) => {
-      if (event.target instanceof Element && event.target.closest("button")) return;
-      pointers.set(event.pointerId, { x: event.clientX, y: event.clientY });
-      velLat = 0;
-      velLng = 0;
-      filtDx = 0;
-      filtDy = 0;
-      lastGesture = performance.now();
-      spin = false;
-      if (pointers.size === 1) dragged = 0;
-      else dragged = 40;
-      const pair = pinchPair();
-      if (pair) {
-        pinchDist = pair.dist;
-        pinchX = pair.x;
-        pinchY = pair.y;
-      }
-      try {
-        canvas.setPointerCapture(event.pointerId);
-      } catch {
-        /* pointer already gone */
-      }
-    };
-    const nearest = (clientX: number, clientY: number, reach: number): Hit | null => {
-      const rect = canvas.getBoundingClientRect();
-      const x = clientX - rect.left;
-      const y = clientY - rect.top;
-      let best: Hit | null = null;
-      let bestD = reach;
-      for (const hit of hitsRef.current) {
-        const d = Math.hypot(hit.x - x, hit.y - y);
-        if (d < bestD) {
-          best = hit;
-          bestD = d;
-        }
-      }
-      return best;
-    };
-    const move = (event: PointerEvent) => {
-      const prev = pointers.get(event.pointerId);
-      if (!prev) {
-        if (event.pointerType !== "mouse") return;
-        const next = nearest(event.clientX, event.clientY, 16)?.id ?? null;
-        if (next !== hoverId) {
-          hoverId = next;
-          canvas.style.cursor = next ? "pointer" : "";
-        }
-        return;
-      }
-      if (hoverId) {
-        hoverId = null;
-        canvas.style.cursor = "";
-      }
-      pointers.set(event.pointerId, { x: event.clientX, y: event.clientY });
-      if (event.cancelable) event.preventDefault();
-      const pair = pinchPair();
-      const gestureNow = performance.now();
-      const gestureDt = lastGesture ? gestureNow - lastGesture : 16;
-      lastGesture = gestureNow;
-      if (pair && pinchDist > 8) {
-        const aim = targetRef.current;
-        const before = aim.zoom;
-        const grow = pair.dist / pinchDist;
-        aim.zoom = clamp(aim.zoom + Math.log(grow) / Math.log(1.85), ZOOM_MIN, ZOOM_MAX);
-        zoomAbout(pair.x, pair.y, before);
-        applyDrag(pair.x - pinchX, pair.y - pinchY, gestureDt);
-        pinchDist = pair.dist;
-        pinchX = pair.x;
-        pinchY = pair.y;
-        dragged += 4;
-        return;
-      }
-      const dx = event.clientX - prev.x;
-      const dy = event.clientY - prev.y;
-      dragged += Math.abs(dx) + Math.abs(dy);
-      applyDrag(dx, dy, gestureDt);
-    };
-    const up = (event: PointerEvent) => {
-      pointers.delete(event.pointerId);
-      if (pointers.size < 2) pinchDist = 0;
-      if (pointers.size === 0 && performance.now() - lastGesture > 80) {
-        velLat = 0;
-        velLng = 0;
-      }
-      if (pointers.size === 0 && dragged < 8) {
-        const t = performance.now();
-        if (t - lastTap < 280 && Math.hypot(event.clientX - lastTapX, event.clientY - lastTapY) < 28) {
-          const aim = targetRef.current;
-          const before = aim.zoom;
-          aim.zoom = clamp(aim.zoom + 1.05, ZOOM_MIN, ZOOM_MAX);
-          zoomAbout(event.clientX, event.clientY, before);
-          velLat = 0;
-          velLng = 0;
-          dragged = 40;
-        }
-        lastTap = t;
-        lastTapX = event.clientX;
-        lastTapY = event.clientY;
-      }
-    };
-    const click = (event: MouseEvent) => {
-      if (dragged > 8) return;
-      const best = nearest(event.clientX, event.clientY, 28);
-      if (best) onSelectRef.current(best.id);
-    };
-    const leave = () => {
-      hoverId = null;
-      canvas.style.cursor = "";
-    };
-    const wheel = (event: WheelEvent) => {
-      if (event.target instanceof Element && event.target.closest("button")) return;
-      event.preventDefault();
-      const aim = targetRef.current;
-      const before = aim.zoom;
-      const unit = event.deltaMode === 1 ? 16 : event.deltaMode === 2 ? 400 : 1;
-      const raw = event.ctrlKey ? -event.deltaY * unit * 0.012 : -event.deltaY * unit * 0.0015;
-      aim.zoom = clamp(aim.zoom + clamp(raw, -1.15, 1.15), ZOOM_MIN, ZOOM_MAX);
-      zoomAbout(event.clientX, event.clientY, before);
-      spin = false;
-      velLat = 0;
-      velLng = 0;
-    };
-
-    canvas.addEventListener("pointerdown", down);
-    canvas.addEventListener("pointermove", move, { passive: false });
-    canvas.addEventListener("pointerup", up);
-    canvas.addEventListener("pointercancel", up);
-    canvas.addEventListener("click", click);
-    canvas.addEventListener("pointerleave", leave);
-    wrap.addEventListener("wheel", wheel, { passive: false });
-    // touch-action alone does not stop iOS from scrolling the page or dragging an in-app
-    // browser sheet while a finger turns the globe; cancelling the touch moves does.
-    const holdTouch = (event: TouchEvent) => {
-      if (event.cancelable) event.preventDefault();
-    };
-    const holdGesture = (event: Event) => event.preventDefault();
-    canvas.addEventListener("touchmove", holdTouch, { passive: false });
-    canvas.addEventListener("gesturestart", holdGesture);
-
+    // Live markers drift with dead reckoning, and the night side moves with the sun.
+    const timer = window.setInterval(() => {
+      setTick((value) => value + 1);
+      const m = mapRef.current;
+      if (m?.isStyleLoaded()) setNight(m, Date.now());
+    }, 60_000);
+    const markers = markersRef.current;
     return () => {
-      cancelAnimationFrame(frame);
-      observer.disconnect();
-      canvas.removeEventListener("pointerdown", down);
-      canvas.removeEventListener("pointermove", move);
-      canvas.removeEventListener("pointerup", up);
-      canvas.removeEventListener("pointercancel", up);
-      canvas.removeEventListener("click", click);
-      canvas.removeEventListener("pointerleave", leave);
-      wrap.removeEventListener("wheel", wheel);
-      canvas.removeEventListener("touchmove", holdTouch);
-      canvas.removeEventListener("gesturestart", holdGesture);
-      for (const surface of [lo, hi]) {
-        surface.canvas.width = 0;
-        surface.canvas.height = 0;
-      }
-      tileScratch.width = 0;
-      tileScratch.height = 0;
+      cancelled = true;
+      window.clearInterval(timer);
+      for (const entry of markers.values()) entry.marker.remove();
+      markers.clear();
+      map?.remove();
+      mapRef.current = null;
     };
   }, []);
 
+  // Push data into the map: clustered sightings, quiet tags, wakes, and DOM markers for live ones.
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!ready || !map) return;
+    const now = Date.now();
+    const reduced = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    const routeById = new Map(routes.map((route) => [route.id, route]));
+    const sightings: Feature[] = [];
+    const quiet: Feature[] = [];
+    const live: Signal[] = [];
+    for (const signal of signals) {
+      if (signal.id === selectedId || isLive(signal, now)) live.push(signal);
+      else if (signal.kind === "sighting") sightings.push(point(signal));
+      else quiet.push(point(signal));
+    }
+    (map.getSource("sightings") as GeoJSONSource).setData({ type: "FeatureCollection", features: sightings });
+    (map.getSource("quiet") as GeoJSONSource).setData({ type: "FeatureCollection", features: quiet });
+
+    // Wakes: the last month of each live tag's path, fading toward its tail.
+    const wakes: Feature[] = [];
+    for (const signal of live) {
+      const route = routeById.get(signal.id);
+      if (!route || route.points.length < 2 || signal.id === selectedId) continue;
+      const lastAt = Date.parse(route.points[route.points.length - 1].at);
+      const tail = route.points.filter((p) => lastAt - Date.parse(p.at) <= LIVE_MS).slice(-24);
+      if (tail.length < 2) continue;
+      wakes.push({
+        type: "Feature",
+        properties: { group: signal.group },
+        geometry: { type: "LineString", coordinates: tail.map((p) => [p.lng, p.lat]) },
+      });
+    }
+    (map.getSource("wakes") as GeoJSONSource).setData({ type: "FeatureCollection", features: wakes });
+
+    const focus = selectedId ? routeById.get(selectedId) : undefined;
+    (map.getSource("focus") as GeoJSONSource).setData(
+      focus && focus.points.length > 1
+        ? {
+            type: "Feature",
+            properties: {},
+            geometry: { type: "LineString", coordinates: focus.points.map((p) => [p.lng, p.lat]) },
+          }
+        : EMPTY,
+    );
+
+    // DOM markers: real buttons, crisp at any density, animated in CSS.
+    let cancelled = false;
+    void import("maplibre-gl").then(({ default: maplibregl }) => {
+      if (cancelled) return;
+      const markers = markersRef.current;
+      const keep = new Set<string>();
+      for (const signal of live) {
+        keep.add(signal.id);
+        const route = routeById.get(signal.id);
+        const at = route && route.points.length > 1 ? liveFix(route.points, now, reduced) : signal;
+        const leg = route ? trackLeg(route.points) : null;
+        const hot = signal.kind === "tag" && now - Date.parse(signal.observedAt) < 2 * DAY;
+        const hearing = signal.kind === "heard" && Boolean(signal.heard?.recent.length);
+        const selected = signal.id === selectedId;
+        const key = `${signal.kind}|${signal.group}|${hot}|${hearing}|${selected}|${Math.round(leg?.heading ?? -1)}|${signal.name}`;
+        let entry = markers.get(signal.id);
+        if (!entry) {
+          const el = document.createElement("button");
+          el.type = "button";
+          const id = signal.id;
+          el.addEventListener("click", (event) => {
+            event.stopPropagation();
+            spinRef.current = false;
+            onSelectRef.current(id);
+          });
+          const marker = new maplibregl.Marker({ element: el, anchor: "center", opacityWhenCovered: "0" })
+            .setLngLat([at.lng, at.lat])
+            .addTo(map);
+          entry = { marker, el, key: "" };
+          markers.set(signal.id, entry);
+        } else {
+          entry.marker.setLngLat([at.lng, at.lat]);
+        }
+        if (entry.key === key) continue;
+        entry.key = key;
+        const el = entry.el;
+        // Keep MapLibre's own marker classes: they position the element.
+        el.className = [
+          ...[...el.classList].filter((name) => name.startsWith("maplibregl-")),
+          "fs-marker",
+          `fs-${signal.group}`,
+          `fs-kind-${signal.kind}`,
+          hot || hearing ? "fs-hot" : "",
+          selected ? "fs-selected" : "",
+        ]
+          .filter(Boolean)
+          .join(" ");
+        el.style.zIndex = selected ? "3" : hot || hearing ? "2" : "1";
+        el.setAttribute("aria-label", `${signal.name}, ${signal.common}`);
+        el.textContent = "";
+        const dot = document.createElement("span");
+        dot.className = "fs-dot";
+        el.append(dot);
+        if (leg && signal.kind === "tag") {
+          const arrow = document.createElement("span");
+          arrow.className = "fs-heading";
+          arrow.style.transform = `rotate(${Math.round(leg.heading)}deg)`;
+          el.append(arrow);
+        }
+        const label = document.createElement("span");
+        label.className = "fs-label";
+        label.textContent = signal.name.length > 22 ? `${signal.name.slice(0, 21)}…` : signal.name;
+        el.append(label);
+      }
+      for (const [id, entry] of markers) {
+        if (keep.has(id)) continue;
+        entry.marker.remove();
+        markers.delete(id);
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [ready, signals, routes, selectedId, tick]);
+
+  // Fly to a newly selected signal.
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!ready || !map || !selectedId) return;
+    const signal = signals.find((item) => item.id === selectedId);
+    if (!signal) return;
+    const route = routes.find((item) => item.id === selectedId);
+    const at = route && route.points.length > 1 ? liveFix(route.points, Date.now(), false) : signal;
+    spinRef.current = false;
+    const wrap = wrapRef.current;
+    const base = wrap ? fitZoom(wrap.clientWidth, wrap.clientHeight) : 1.5;
+    map.flyTo({
+      center: [at.lng, clamp(at.lat, -80, 80)],
+      zoom: Math.max(map.getZoom(), base + 2.6),
+      speed: 1.4,
+      curve: 1.5,
+    });
+    // Only on selection changes (and once the signal first shows up); refreshes must not
+    // yank the camera back.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [ready, selectedId, Boolean(signals.find((item) => item.id === selectedId))]);
+
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!ready || !map || !jump) return;
+    spinRef.current = false;
+    const wrap = wrapRef.current;
+    const base = wrap ? fitZoom(wrap.clientWidth, wrap.clientHeight) : 1.5;
+    map.flyTo({ center: [jump.lng, jump.lat], zoom: jumpZoom(base, jump.zoom), speed: 1.3 });
+  }, [ready, jump]);
+
+  // Names appear once the globe is close enough for them not to pile up.
+  useEffect(() => {
+    const map = mapRef.current;
+    const wrap = wrapRef.current;
+    if (!ready || !map || !wrap) return;
+    const sync = () => {
+      const base = fitZoom(wrap.clientWidth, wrap.clientHeight);
+      wrap.classList.toggle("fs-named", map.getZoom() > base + 1.3);
+    };
+    sync();
+    map.on("zoomend", sync);
+    return () => {
+      map.off("zoomend", sync);
+    };
+  }, [ready]);
+
   const zoomBy = (delta: number) => {
-    const aim = targetRef.current;
-    aim.zoom = clamp(aim.zoom + delta, ZOOM_MIN, ZOOM_MAX);
+    spinRef.current = false;
+    const map = mapRef.current;
+    if (map) map.easeTo({ zoom: map.getZoom() + delta, duration: 350 });
   };
 
   return (
-    <div ref={wrapRef} className="globe-stage absolute inset-0 bg-bg">
-      <canvas ref={canvasRef} className="block h-full w-full cursor-grab touch-none active:cursor-grabbing" aria-label="Ocean globe" />
+    <div className="globe-stage absolute inset-0 bg-bg">
+      {/* MapLibre makes its container position: relative, so it needs an explicit full size. */}
+      <div ref={wrapRef} className="pelagos-map h-full w-full" aria-label="Ocean globe" />
+      <div ref={tipRef} className="fs-tip" hidden />
+      {failed ? (
+        <div className="absolute inset-0 grid place-items-center p-6 text-center font-mono text-sm text-muted">
+          <p>
+            The 3D globe needs WebGL, which this browser has turned off.
+            <br />
+            The Signals list still shows every animal.
+          </p>
+        </div>
+      ) : null}
       <div className="zoom-stack">
-        <button type="button" className="hud-panel grid size-11 place-items-center text-fg" onClick={() => zoomBy(0.65)} aria-label="Zoom in">
+        <button
+          type="button"
+          className="hud-panel grid size-11 place-items-center text-fg"
+          onClick={() => zoomBy(1)}
+          aria-label="Zoom in"
+        >
           <Plus className="size-4" />
         </button>
-        <button type="button" className="hud-panel grid size-11 place-items-center text-fg" onClick={() => zoomBy(-0.65)} aria-label="Zoom out">
+        <button
+          type="button"
+          className="hud-panel grid size-11 place-items-center text-fg"
+          onClick={() => zoomBy(-1)}
+          aria-label="Zoom out"
+        >
           <Minus className="size-4" />
         </button>
       </div>
