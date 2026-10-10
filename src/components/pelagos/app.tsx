@@ -446,10 +446,12 @@ export function PelagosApp({
       />
 
       <header className="pointer-events-none absolute inset-x-0 top-0 z-40 flex flex-col p-3 md:p-4">
-        <div ref={menuRef} className="pointer-events-auto relative">
+        {/* The header spans the screen width; only its buttons and cards take input, so the
+            globe underneath stays draggable everywhere else. */}
+        <div ref={menuRef} className="pointer-events-none relative">
           <div className="flex items-start justify-between gap-2">
             <div className="flex min-w-0 items-start gap-2">
-              <div className="brand-lockup hud-panel flex items-center gap-3 px-3 py-2">
+              <div className="brand-lockup hud-panel pointer-events-auto flex items-center gap-3 px-3 py-2">
                 <div className="reticle shrink-0" aria-hidden="true">
                   <span className="reticle-sweep" />
                 </div>
@@ -457,7 +459,7 @@ export function PelagosApp({
               </div>
               <button
                 type="button"
-                className="signal-toggle hud-panel inline-flex min-h-11 items-center gap-2 px-4 font-mono text-sm text-fg"
+                className="signal-toggle hud-panel pointer-events-auto inline-flex min-h-11 items-center gap-2 px-4 font-mono text-sm text-fg"
                 aria-expanded={menuOpen}
                 aria-label="Search and filter animals"
                 onClick={() => setMenuOpen((open) => !open)}
@@ -485,25 +487,6 @@ export function PelagosApp({
               </button>
             ))}
           </div>
-          {intro && !menuOpen && !selected ? (
-            <div className="intro hud-panel" role="note">
-              <p className="font-display text-lg leading-tight text-fg">Ocean life, live.</p>
-              <p className="mt-1 text-muted">
-                <span className="intro-key">
-                  <i className="size-2.5 rounded-full bg-shark" /> Glowing dots
-                </span>{" "}
-                are satellite-tagged sharks and whales,{" "}
-                <span className="intro-key">
-                  <i className="heard-ring" /> rings
-                </span>{" "}
-                are underwater microphones hearing whale calls, and small dots are recent sightings.
-                Tap anything to follow it.
-              </p>
-              <button type="button" className="intro-close" onClick={closeIntro}>
-                Got it
-              </button>
-            </div>
-          ) : null}
           {menuOpen ? (
             <div className="menu-drop hud-panel">
               <ListPane
@@ -548,6 +531,25 @@ export function PelagosApp({
         </aside>
       ) : (
         <div className="dock">
+          {intro ? (
+            <div className="intro hud-panel" role="note">
+              <p className="font-display text-lg leading-tight text-fg">Ocean life, live.</p>
+              <p className="mt-1 text-muted">
+                <span className="intro-key">
+                  <i className="size-2.5 rounded-full bg-shark" /> Glowing dots
+                </span>{" "}
+                are satellite-tagged sharks and whales,{" "}
+                <span className="intro-key">
+                  <i className="heard-ring" /> rings
+                </span>{" "}
+                are underwater microphones hearing whale calls, and small dots are recent sightings.
+                Tap anything to follow it.
+              </p>
+              <button type="button" className="intro-close" onClick={closeIntro}>
+                Got it
+              </button>
+            </div>
+          ) : null}
           {loading || feedsDown ? (
             <p className={`pulse hud-panel ${feedsDown ? "text-shark" : "text-muted"}`}>
               {feedsDown ? "Tracking feeds unreachable · retrying" : "Sweeping the basins…"}
