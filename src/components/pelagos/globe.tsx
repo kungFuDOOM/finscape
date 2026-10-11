@@ -43,6 +43,19 @@ function fitZoom(w: number, h: number): number {
   return Math.log2((0.4 * Math.min(w, h)) / 81.5);
 }
 
+/**
+ * On the globe MapLibre lowers the zoom number as the centre moves poleward (by log2 cos lat), so
+ * the globe keeps its size. These convert between that and a size-true zoom, which reads the
+ * same at every latitude.
+ */
+function sizeZoom(map: MapLibreMap): number {
+  return map.getZoom() - Math.log2(Math.cos(clamp(map.getCenter().lat, -85, 85) * (Math.PI / 180)));
+}
+
+function zoomAt(size: number, lat: number): number {
+  return size + Math.log2(Math.cos(clamp(lat, -85, 85) * (Math.PI / 180)));
+}
+
 /** The app's jump zooms were written for the old renderer (radius × 1.85^z); convert them. */
 function jumpZoom(base: number, legacy: number): number {
   return base + legacy * Math.log2(1.85);
@@ -226,6 +239,8 @@ function GlobeViewInner({ signals, routes, selectedId, onSelect, jump }: Props) 
             maxPitch: 0,
             renderWorldCopies: false,
             fadeDuration: 150,
+            // Past 2x the extra pixels cost a weak GPU far more than they add to satellite imagery.
+            pixelRatio: Math.min(window.devicePixelRatio || 1, 2),
           });
         } catch (error) {
           setFailed(error instanceof Error ? error.message : "WebGL unavailable");
@@ -243,7 +258,7 @@ function GlobeViewInner({ signals, routes, selectedId, onSelect, jump }: Props) 
         };
         // Spin slowly until the first interaction, like a globe on a desk.
         const spin = () => {
-          if (!spinRef.current || m.getZoom() > base + 1) return;
+          if (!spinRef.current || sizeZoom(m) > base + 1) return;
           const center = m.getCenter();
           center.lng -= 3;
           m.easeTo({ center, duration: 2000, easing: (n) => n });
@@ -457,9 +472,10 @@ function GlobeViewInner({ signals, routes, selectedId, onSelect, jump }: Props) 
     spinRef.current = false;
     const wrap = wrapRef.current;
     const base = wrap ? fitZoom(wrap.clientWidth, wrap.clientHeight) : 1.5;
+    const lat = clamp(at.lat, -80, 80);
     map.flyTo({
-      center: [at.lng, clamp(at.lat, -80, 80)],
-      zoom: Math.max(map.getZoom(), base + 2.6),
+      center: [at.lng, lat],
+      zoom: zoomAt(Math.max(sizeZoom(map), base + 2.6), lat),
       speed: 1.4,
       curve: 1.5,
     });
@@ -474,7 +490,11 @@ function GlobeViewInner({ signals, routes, selectedId, onSelect, jump }: Props) 
     spinRef.current = false;
     const wrap = wrapRef.current;
     const base = wrap ? fitZoom(wrap.clientWidth, wrap.clientHeight) : 1.5;
-    map.flyTo({ center: [jump.lng, jump.lat], zoom: jumpZoom(base, jump.zoom), speed: 1.3 });
+    map.flyTo({
+      center: [jump.lng, jump.lat],
+      zoom: zoomAt(jumpZoom(base, jump.zoom), jump.lat),
+      speed: 1.3,
+    });
   }, [ready, jump]);
 
   // Names appear once the globe is close enough for them not to pile up.
@@ -484,12 +504,13 @@ function GlobeViewInner({ signals, routes, selectedId, onSelect, jump }: Props) 
     if (!ready || !map || !wrap) return;
     const sync = () => {
       const base = fitZoom(wrap.clientWidth, wrap.clientHeight);
-      wrap.classList.toggle("fs-named", map.getZoom() > base + 1.3);
+      wrap.classList.toggle("fs-named", sizeZoom(map) > base + 1.3);
     };
     sync();
-    map.on("zoomend", sync);
+    // Panning changes the zoom number too (see sizeZoom), so check after every move.
+    map.on("moveend", sync);
     return () => {
-      map.off("zoomend", sync);
+      map.off("moveend", sync);
     };
   }, [ready]);
 
